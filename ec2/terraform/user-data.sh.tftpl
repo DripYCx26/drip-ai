@@ -1,0 +1,56 @@
+#!/bin/bash
+# First-boot setup for the model server. Rendered by Terraform; runs once as root via cloud-init.
+# The container restarts on its own after a stop/start, so this script does not need to rerun.
+set -euo pipefail
+exec > >(tee -a /var/log/drip-ai-bootstrap.log) 2>&1
+
+for tool in docker nvidia-ctk aws nvidia-smi; do
+  command -v "$tool" >/dev/null || { echo "bootstrap: $tool missing from the AMI"; exit 1; }
+done
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+read_secret() {
+  aws ssm get-parameter --region ${region} --name "$1" --with-decryption --query Parameter.Value --output text
+}
+
+# Plain assignments so set -e aborts on a failed read. vLLM disables auth when the key is empty.
+api_key="$(read_secret '${api_key_parameter}')"
+[ -n "$api_key" ] || { echo "bootstrap: empty API key"; exit 1; }
+%{ if hf_token_parameter != "" ~}
+hf_token="$(read_secret '${hf_token_parameter}')"
+%{ endif ~}
+
+install -d -m 700 /etc/drip-ai
+env_file=/etc/drip-ai/vllm.env
+umask 077
+{
+  echo "VLLM_API_KEY=$api_key"
+%{ if hf_token_parameter != "" ~}
+  echo "HF_TOKEN=$hf_token"
+%{ endif ~}
+} > "$env_file"
+
+install -d /opt/models /opt/hf-cache
+%{ if model_from_s3 ~}
+aws s3 sync --region ${region} --only-show-errors 's3://${bucket}/models/${model_source}/' '/opt/models/${model_source}/'
+[ -f '/opt/models/${model_source}/config.json' ] || { echo "bootstrap: no config.json in s3://${bucket}/models/${model_source}/"; exit 1; }
+model_arg='/models/${model_source}'
+%{ else ~}
+model_arg='${model_source}'
+%{ endif ~}
+
+docker pull '${vllm_image}'
+docker run -d --name vllm --restart unless-stopped \
+  --gpus all --ipc=host \
+  -p 127.0.0.1:8000:8000 \
+  --env-file "$env_file" \
+  -v /opt/models:/models:ro \
+  -v /opt/hf-cache:/root/.cache/huggingface \
+  '${vllm_image}' \
+  "$model_arg" \
+  --served-model-name '${served_model_name}' \
+  --tensor-parallel-size ${tensor_parallel_size} \
+  --max-model-len ${max_model_len} \
+  ${vllm_extra_args}
+
+echo "bootstrap: vllm container started; first load downloads weights and can take several minutes"

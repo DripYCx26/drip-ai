@@ -1,0 +1,25 @@
+# Copy to terraform.tfvars (gitignored). `bin/drip-ai ec2 apply` reads it and refuses
+# until it sets model_source, so uncomment and set the model below.
+# model_source: a Hugging Face repo (Org/Name), or with model_from_s3 = true a folder
+# under models/ in the models bucket (copy one in with `bin/drip-ai fetch` or
+# `bin/drip-ai models upload`).
+# model_source  = "Org/Model"
+# model_from_s3 = false
+
+# Keep region equal to the Region bin/drip-ai uses (DRIP_AI_REGION, default us-east-1):
+# the state bucket and the shared stack live there, and a value here overrides the
+# TF_VAR_region the helper exports.
+region        = "us-east-1"
+instance_type = "g6e.12xlarge" # 4x L40S, 192 GB. See docs/models.md for sizing.
+
+served_model_name    = "drip-coder"
+tensor_parallel_size = 4 # Must equal the instance GPU count.
+max_model_len        = 32768
+
+# Set any tool-call and reasoning parsers from your model's documented vLLM flags.
+# See docs/models.md for flag configuration.
+vllm_extra_args = []
+
+# For gated models, use the AWS console to store a token as a SecureString,
+# such as /drip-ai/ec2-hf-token. /drip-ai/hf-token is reserved for the fetch job.
+hf_token_parameter = ""

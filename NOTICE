@@ -1,0 +1,17 @@
+drip-ai
+
+Original project code is licensed under the MIT License. See LICENSE.
+
+shared/model-profiles/vllm-architectures.json contains architecture names
+extracted from vLLM's generative model registry at v0.30.0:
+https://github.com/vllm-project/vllm/blob/v0.30.0/vllm/model_executor/models/registry.py
+Copyright contributors to the vLLM project. Licensed under Apache-2.0.
+The generated file selects names from three registry tables and records its
+source and version; it does not include the upstream implementation.
+The upstream license is included in licenses/vllm-Apache-2.0.txt.
+
+vLLM container images, Terraform and its providers, AWS tooling, coding
+clients, and model weights are obtained separately and retain their own
+licenses and terms. This repository does not distribute model weights.
+Architecture names describe upstream compatibility, not deployed models.
+Names and trademarks remain the property of their respective owners.

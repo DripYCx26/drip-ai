@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# The drip-ai entry point: routes `drip-ai <group> <command> [args]` to the scripts that own each
+# command. Design: docs/DECISIONS.md, 2026-10-05 "Folders per backend, Terraform roots per stack".
+# Every apply and destroy shows its plan and waits for the user's yes; a --yes the user passed to
+# that run answers it after the plan prints.
+set -euo pipefail
+
+# Follows symlinks so a link on PATH (for example ~/bin/drip-ai) still finds the checkout.
+script_path="$0"
+while [ -L "$script_path" ]; do
+  link_target="$(readlink "$script_path")"
+  case "$link_target" in
+    /*) script_path="$link_target" ;;
+    *) script_path="$(dirname "$script_path")/$link_target" ;;
+  esac
+done
+repo_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+# shellcheck source=../shared/lib/common.sh
+source "$repo_root/shared/lib/common.sh"
+
+# Every root that keeps state in the shared bucket, in the order setup and init visit them.
+state_roots="shared fetch-model sagemaker ec2"
+
+usage() {
+  cat <<'EOF_USAGE'
+Usage: bin/drip-ai <group> <command> [args]
+
+  setup [--yes]               create the state bucket if missing, init every root, then apply the shared stack (asks first)
+  init [--reconfigure]        init every root against your account's state bucket
+  check                       run the repo gate (shared/check.sh)
+  up [name] [--yes]           sagemaker start, then the tunnel, with a smoke test once the clients link;
+                              Ctrl-C closes the tunnel, and the endpoint bills until sagemaker stop
+  sagemaker start [name] [--yes]
+                              start the endpoint from a model in S3 (asks before spending)
+  sagemaker stop [--force] [--yes]
+  sagemaker status|logs|watch|list
+  sagemaker tunnel [--no-link | --smoke]
+                              serve 127.0.0.1:8000 and link Codex, Claude Code, and opencode until it closes
+  sagemaker deploy <folder> [--take-over] [--yes]
+                              upload models/<folder>/ and start it (asks before spending);
+                              refuses before uploading while any endpoint is running
+  ec2 apply|destroy|start [--yes]
+                              create, delete, or start the EC2 server from ec2/terraform/terraform.tfvars
+  ec2 stop|status|logs
+  ec2 tunnel [--no-link]      serve 127.0.0.1:8000 and link the clients, as sagemaker tunnel does
+  fetch [args] [--yes]        copy a Hugging Face model into S3 (shared/fetch-model/fetch-model.sh)
+  models upload <folder>|list
+  key                         print the API key into a pipe: export DRIP_AI_API_KEY="$(bin/drip-ai key)"
+  smoke                       check every API on the open tunnel
+  link [CLIENT] --model NAME --context-window TOKENS
+                              point CLIENT (codex, claude, opencode; default every installed one) at
+                              127.0.0.1:8000 by hand; the tunnels do this themselves
+  unlink [CLIENT] [--force]   restore CLIENT's config (default all); sagemaker stop and ec2 stop|destroy run it
+  status [CLIENT]             whether each client is linked
+  status --json               one JSON object of what runs and bills, for an app to poll; reads only
+  codex link|unlink|status    Codex's link program with all its flags
+  tf <stack> <terraform args> run Terraform in one stack (bootstrap, shared, fetch-model, sagemaker, ec2)
+                              with the generated backend; for import, destroy, -replace (asks first)
+  help
+
+--yes answers only that run's own question (Terraform's apply or destroy, start's race, fetch's
+launch) after the plan and costs print. It never types an endpoint name for --take-over or
+--force, and never the Hugging Face token: fetch --yes refuses a gated repo.
+Region: DRIP_AI_REGION, else AWS_REGION, else AWS_DEFAULT_REGION, else us-east-1.
+Links: DRIP_AI_LINK_CLIENTS=codex,claude (or all, or none) picks what a tunnel links; DRIP_AI_PORT moves 8000.
+EOF_USAGE
+}
+
+usage_fail() {
+  echo "drip-ai: $1" >&2
+  usage >&2
+  exit 2
+}
+
+run_script() {
+  local script="$1"
+  shift
+  [ -f "$repo_root/$script" ] || { echo "drip-ai: $script not found in this checkout" >&2; exit 1; }
+  exec bash "$repo_root/$script" "$@"
+}
+
+# Runs every state root that exists; a root folder not created yet is skipped by name.
+init_roots() {
+  local key dir
+  for key in $state_roots; do
+    dir="$(tf_root_dir "$key")"
+    if [ ! -d "$dir" ]; then
+      echo "Skipping $key: ${dir#"$repo_root"/}/ does not exist yet."
+      continue
+    fi
+    echo "== init $key"
+    tf_init "$key" "$@" || { echo "drip-ai: init failed for $key" >&2; exit 1; }
+  done
+}
+
+# bootstrap/ keeps local state. Each apply shows its plan and the user types yes, or passed --yes;
+# the shared apply is a no-op plan once the shared stack exists.
+setup() {
+  local region bucket state yes=no
+  case "$#:${1:-}" in
+    0:) ;;
+    1:--yes) yes=yes ;;
+    *) usage_fail "setup takes only --yes" ;;
+  esac
+  require_tools || exit 1
+  load_caller_identity || exit 1
+  region="$(drip_region)" || exit 1
+  bucket="$(state_bucket)" || exit 1
+  state="$(state_bucket_state "$bucket" "$region")" || exit 1
+  if [ "$state" = missing ]; then
+    [ -d "$repo_root/bootstrap" ] || { echo "drip-ai: bootstrap/ not found" >&2; exit 1; }
+    echo "Creating the state bucket $bucket with bootstrap/; Terraform shows the plan before it creates anything."
+    tf_init bootstrap || exit 1
+    tf_approved "$yes" bootstrap apply || { echo "drip-ai: the bootstrap apply failed or was declined" >&2; exit 1; }
+  else
+    echo "State bucket $bucket exists."
+  fi
+  init_roots
+  echo "== apply shared (the models bucket, the API key, and the resource group)"
+  tf_approved "$yes" shared apply || { echo "drip-ai: the shared apply failed or was declined" >&2; exit 1; }
+  echo "Ready. Next: bin/drip-ai fetch <Org/Name>"
+}
+
+# up [NAME] [--yes]: `sagemaker start` returning once your endpoint serves, then `sagemaker tunnel
+# --smoke` in the foreground. A failed or declined start stops here. The tunnel unlinks the clients
+# on Ctrl-C; this shell only waits for it, then says what still bills.
+up() {
+  local argument model="" yes=() status=0
+  for argument in "$@"; do
+    case "$argument" in
+      --yes) yes=(--yes) ;;
+      -*) usage_fail "up takes a model name and --yes" ;;
+      *) [ -z "$model" ] || usage_fail "up takes one model name"; model="$argument" ;;
+    esac
+  done
+  bash "$repo_root/sagemaker/start.sh" ${model:+"$model"} ${yes[@]+"${yes[@]}"} --no-watch || exit $?
+  # A trapped INT waits for the tunnel to unlink and exit; an ignored one would be inherited, and the
+  # tunnel could not trap it.
+  trap ':' INT
+  bash "$repo_root/sagemaker/endpoint.sh" tunnel --smoke || status=$?
+  echo "The endpoint still bills until bin/drip-ai sagemaker stop"
+  exit "$status"
+}
+
+# status --json: the read-only snapshot shared/status.py prints; anything else is the client status.
+status_command() {
+  local region
+  if [ "$*" != --json ]; then
+    run_script shared/clients.sh status "$@"
+  fi
+  region="$(drip_region)" || exit 1
+  exec python3 -I "$repo_root/shared/status.py" --region "$region"
+}
+
+init_command() {
+  case "$#:${1:-}" in
+    0:) init_roots ;;
+    1:--reconfigure) init_roots --reconfigure ;;
+    *) usage_fail "init takes only --reconfigure" ;;
+  esac
+  return 0
+}
+
+sagemaker_command() {
+  local command="${1:-}"
+  shift || true
+  case "$command" in
+    start) run_script sagemaker/start.sh "$@" ;;
+    watch) run_script sagemaker/start.sh --watch "$@" ;;
+    list) run_script sagemaker/start.sh --list "$@" ;;
+    stop | status | logs | tunnel | deploy) run_script sagemaker/endpoint.sh "$command" "$@" ;;
+    *) usage_fail "unknown sagemaker command '$command'" ;;
+  esac
+}
+
+ec2_command() {
+  local command="${1:-}"
+  shift || true
+  case "$command" in
+    apply | destroy | start | stop | status | logs | tunnel) run_script ec2/server.sh "$command" "$@" ;;
+    *) usage_fail "unknown ec2 command '$command'" ;;
+  esac
+}
+
+models_command() {
+  local command="${1:-}"
+  shift || true
+  case "$command" in
+    upload | list) run_script shared/models.sh "$command" "$@" ;;
+    *) usage_fail "unknown models command '$command'" ;;
+  esac
+}
+
+codex_command() {
+  local command="${1:-}"
+  case "$command" in
+    link | unlink | status) run_script shared/clients.sh codex "$@" ;;
+    *) usage_fail "unknown codex command '$command'" ;;
+  esac
+}
+
+group="${1:-}"
+shift || true
+case "$group" in
+  setup) setup "$@" ;;
+  init) init_command "$@" ;;
+  check) run_script shared/check.sh "$@" ;;
+  sagemaker) sagemaker_command "$@" ;;
+  ec2) ec2_command "$@" ;;
+  fetch) run_script shared/fetch-model/fetch-model.sh "$@" ;;
+  models) models_command "$@" ;;
+  up) up "$@" ;;
+  status) status_command "$@" ;;
+  key | smoke | link | unlink) run_script shared/clients.sh "$group" "$@" ;;
+  codex) codex_command "$@" ;;
+  tf)
+    [ $# -ge 2 ] || usage_fail "tf needs a stack and Terraform arguments"
+    tf_root_dir "$1" >/dev/null || exit 1
+    tf "$@"
+    ;;
+  help | -h | --help) usage ;;
+  "") usage_fail "name a command" ;;
+  *) usage_fail "unknown command '$group'" ;;
+esac

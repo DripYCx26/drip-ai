@@ -1,0 +1,9 @@
+# Scripts and Terraform must keep LF endings on every checkout, including Windows with
+# core.autocrlf, because a CRLF shebang line or heredoc breaks bash.
+*.sh text eol=lf
+*.py text eol=lf
+*.tftpl text eol=lf
+*.hcl text eol=lf
+*.tf text eol=lf
+*.md text eol=lf
+bin/drip-ai text eol=lf

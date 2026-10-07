@@ -1,0 +1,41 @@
+# Terraform working dirs, local state (bootstrap/ keeps its state locally), plans, and per-device tuning.
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/terraform.tfvars
+**/*.auto.tfvars
+**/*.tfvars.json
+**/terraform.tfvars.*
+!**/terraform.tfvars.example
+**/crash.log
+**/crash.*.log
+
+models/*
+!models/README.md
+
+# macOS Finder metadata.
+.DS_Store
+
+# Python bytecode from test runs.
+**/__pycache__/
+
+# Local environment settings; examples remain publishable.
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Logs and private credential files.
+*.log
+logs/
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+
+# Private model-profile copies and backups; profiles.json stays public.
+/shared/model-profiles/profiles.local.json
+/shared/model-profiles/profiles.private.json
+/shared/model-profiles/profiles.json.*
