@@ -1,5 +1,5 @@
-# Claude entry point
+# Agent installation guide
 
-This repo keeps one contract. The rules live in `AGENTS.md`; this file is a pointer so the two can never diverge.
+Read `AGENTS.md` for the agent-assisted installation and setup guide.
 
 @AGENTS.md

@@ -125,7 +125,7 @@ The guides cover the complete workflow:
 - [Troubleshooting](docs/troubleshooting.md): failed starts, credentials, cleanup, and spend.
 - [Architecture](docs/architecture.md) and [decisions](docs/DECISIONS.md): components, contracts, and rationale.
 
-For contributions, read [CONTRIBUTING.md](CONTRIBUTING.md) and run `bin/drip-ai check`. Report security issues as described in [SECURITY.md](SECURITY.md). Agents should read [AGENTS.md](AGENTS.md).
+For contributions, read [CONTRIBUTING.md](CONTRIBUTING.md) and run `bin/drip-ai check`. Report security issues as described in [SECURITY.md](SECURITY.md). For agent-assisted installation, read [AGENTS.md](AGENTS.md).
 
 ## License
 

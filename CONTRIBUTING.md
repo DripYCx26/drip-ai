@@ -8,7 +8,7 @@ open an issue first so maintainers can agree on the scope.
 ## Work on a change
 
 1. Fork the repository and create a branch for your change.
-2. Read [the architecture](docs/architecture.md) and [the contributor rules](AGENTS.md).
+2. Read [the architecture](docs/architecture.md) and, for agent-assisted setup, [the installation guide](AGENTS.md).
 3. Keep the change focused and add regression coverage for changed behavior.
 4. Run the repository check from the root:
 

@@ -1,61 +1,55 @@
-# drip-ai
+# Install drip-ai with an agent
 
-Self-hosted open-weight LLMs on AWS, served by vLLM behind an API key, on a SageMaker endpoint or an EC2 GPU server, for use from opencode, Codex, and Claude Code. This page is the guide for agents; `README.md` and `docs/` are the guide for people.
+Use this guide to help a user set up drip-ai in their own AWS account. Follow the [README walkthrough](README.md#get-started) and the linked backend guides for configuration and command details.
 
-## Layout
+## Prepare the machine and account
 
-Each folder's `README.md` indexes that folder only.
+Install Git, Bash, `curl`, Python 3.9 or newer (`python3`), AWS CLI v2.22 or newer, and Terraform 1.11 or newer. EC2 also requires the Session Manager plugin. See [prerequisites](README.md#prerequisites) for installation links and supported operating systems.
 
-| Path | What it is |
-| --- | --- |
-| `bin/` | `drip-ai`, the one entry point; it routes every command to the script that owns it |
-| `drip-ai.command` | macOS double-click launcher: a Terminal menu over the everyday `bin/drip-ai` commands |
-| `bootstrap/` | Terraform root for the per-account state bucket; keeps local state |
-| `shared/` | Code every backend uses: `terraform/` (models bucket, API key), `fetch-model/` (Hugging Face to S3 job), `model-profiles/` (vLLM flags per model type), `modules/conventions/` (names, image pins), `lib/` (shell library, Codex link), `testing/`, `tests/`, `check.sh`, `models.sh`, `clients.sh` |
-| `sagemaker/` | SageMaker endpoint: `start.sh`, `endpoint.sh`, `proxy.py`, `terraform/`, `tests/` |
-| `ec2/` | EC2 GPU server: `server.sh`, `terraform/` with the boot script, `tests/` |
-| `models/` | Local weight folders to upload; contents are gitignored |
-| `docs/` | The user guide (setup, running, one page per backend, models, clients, troubleshooting), `architecture.md`, and `DECISIONS.md`; `README.md` links every page |
-| `.claude/skills/` | Agent procedures; `.agents/skills` links here for Codex |
+Use the user's AWS profile and chosen Region. Verify the caller with `aws sts get-caller-identity`, then check [permissions](docs/setup.md#permissions) and GPU quota for [SageMaker](docs/sagemaker.md#before-you-start) or [EC2](docs/ec2.md#before-you-start). Use SSO or IAM credentials rather than root keys. If access or quota is missing, report the requirement before proceeding.
 
-## Rules
-
-- Tag every AWS resource `Project=drip-ai`. Each root's provider `default_tags` also sets `ManagedBy=terraform` and `Stack=<stack>`; never create resources outside Terraform, because untagged resources hide spend. The one exception is the ECS task `shared/fetch-model/fetch-model.sh` launches from the Terraform-owned task definition, which carries `Project=drip-ai` from creation.
-- Never run `terraform apply` or `destroy` in any root, `bin/drip-ai setup`, `up`, `sagemaker start|stop|deploy`, `fetch`, or `ec2 apply|destroy|start` without the user approving that run, because a GPU instance, SageMaker endpoint, or Fargate task bills by the hour. An endpoint has no stop; it bills until deleted.
-- Pass `--yes` only to a run the user approved, naming that command and its cost. It answers that run's own `yes` after the plan prints; it never types an endpoint name for `--take-over` or `--force`, nor the Hugging Face token.
-- Run Terraform only through `bin/drip-ai` or the `tf` helper in `shared/lib/common.sh`, because the backend bucket is generated per AWS account at init and the helper refuses a checkout initialised for another account.
-- Never take over or destroy an endpoint `StartedBy` another identity without that person's approval. `sagemaker start --take-over` and `sagemaker stop --force` exist for that; pass them only when the user names the person who agreed.
-- Never add an ingress rule or a public port. Clients connect through `sagemaker tunnel` or `ec2 tunnel`, because vLLM's `--api-key` guards only `/v1` routes. The SageMaker proxy binds `127.0.0.1` only.
-- Never print, commit, or log the API key or a Hugging Face token. Read them from SSM at use time. The user types the Hugging Face token only into the `bin/drip-ai fetch` prompt; never pass it on a command line. Codex and the Claude Code CLI get the key from a command that reads SSM, never from a file. opencode has no such hook, so its key sits in a 0600 file only while a tunnel is linked (see `docs/DECISIONS.md`), and `bin/drip-ai key` goes only into `export DRIP_AI_API_KEY="$(bin/drip-ai key)"`.
-- Pin container images to an exact tag or digest at least one day old. The pins live in `shared/modules/conventions` (`vllm_image`, `sagemaker_image_tag`, `sagemaker_image_digest`); change them only with a dated `docs/DECISIONS.md` entry.
-- Record any change to serving, networking, tagging, or state in `docs/DECISIONS.md`, newest first.
-
-## Operate it
-
-The full procedures are the `model-deploy` and `model-teardown` skills; this is the order. Commands marked approval bill money. Tell the user the command and its cost; once they approve that run, run it yourself with `--yes`, which prints the plan and costs and answers only its own `yes`. Two things stay in the user's own terminal: a private or gated model's Hugging Face token (`fetch --yes` refuses one), and the endpoint name `--take-over` and `--force` ask them to type.
-
-1. Run `bin/drip-ai status --json` (or `sagemaker status`, `ec2 status`, and `models list`) first. It only reads. An endpoint `StartedBy` someone else is theirs; stop and tell the user.
-2. Approval: `bin/drip-ai fetch <Org/Name> --yes` copies a public model to S3; for a gated one, ask the user to run it without `--yes`. Skip it when the model is already in S3 with `fetch` `complete`.
-3. Approval: `bin/drip-ai sagemaker start <name> --yes --no-watch` races one endpoint per `instance_types` entry that holds the model, and returns once one serves.
-4. Ask the user to run `bin/drip-ai sagemaker tunnel` in its own terminal; it holds that terminal. `bin/drip-ai up <name>` in that terminal does steps 3 to 5 at once.
-5. Run `bin/drip-ai smoke`. Only a pass proves the model serves.
-6. Approval: `bin/drip-ai sagemaker stop --yes` deletes the endpoints.
-
-The race prints `After <n> min: <endpoint> <status> ...` whenever a status changes:
-
-- `absent`: not listed yet, already deleted, or another identity's; nothing bills for it.
-- `Creating`: SageMaker is getting capacity and loading the model; treat it as billing. It cannot be deleted until it leaves `Creating`, so keep `start` running until it reports the losers gone.
-- `Failed`: the lane did not start and bills nothing; with no winner, `start` prints each `FailureReason` and exits 1.
-- `InService`: serving; the first one wins and bills until `stop`.
-
-A Terraform timeout after 60 minutes during a race is expected. To report what still bills, run both `status` commands and `aws resource-groups list-group-resources --group drip-ai --query 'ResourceIdentifiers[].ResourceArn'`, and name the S3 weights, which bill until deleted. Failures are in `docs/troubleshooting.md`.
-
-## Gate
-
-Run from the repo root before claiming a change works. It needs no AWS credentials and touches no state:
+From the repository root, inspect the checkout and existing resources first:
 
 ```bash
 bin/drip-ai check
+bin/drip-ai status --json
 ```
 
-A live change is proven only by `bin/drip-ai smoke` with a tunnel open.
+`check` uses mocked AWS calls and temporary Terraform directories; it needs no AWS credentials and creates no cloud resources. Provider downloads need internet access. The public profile map must be `{}` for this check. `status --json` only reads; an unreadable section is unknown, not proof that nothing exists.
+
+## Choose and configure the model
+
+Ask the user which model and backend they want. Confirm their rights to use the weights and read [model configuration](docs/models.md) before any billable command. The public source includes no selected model or parser preset.
+
+For SageMaker, add a local profile to `shared/model-profiles/profiles.json` for the selected model's `model_type`, and copy the backend's `terraform.tfvars.example` if tuning is needed. For EC2, copy `ec2/terraform/terraform.tfvars.example` and set `model_source`, sizing, and `vllm_extra_args`; the public argument default is `[]`. Keep the user's model choices and deployment settings private. Check architecture support, parser flags, GPU memory, context-cache memory, and quota using the [SageMaker](docs/sagemaker.md) or [EC2](docs/ec2.md) guide.
+
+## Approve and run the installation
+
+Explain each command's changes and expected cost before running it. The user's explicit approval of an exact run remains valid; do not ask them to approve that same run again. Approval does not cover a different model, extra race lanes, additional runs, or unrelated deletion. Use the [cost estimates](README.md#costs) as planning guidance and confirm costs for the chosen Region and configuration.
+
+Run `setup`, `fetch`, `up`, `sagemaker start|stop|deploy`, `ec2 apply|destroy|start`, and Terraform apply or destroy only with approval for that run. Use `--yes` on supported commands after approval; it answers only that run's confirmation after the plan prints. Run Terraform through `bin/drip-ai` or the `tf` helper in `shared/lib/common.sh` so account and state guards apply.
+
+For an approved SageMaker installation, replace `Org/Name` with the user's selection and run each separately approved step:
+
+```bash
+bin/drip-ai setup --yes
+bin/drip-ai fetch Org/Name --yes
+bin/drip-ai models list
+bin/drip-ai sagemaker start Org/Name --yes --no-watch
+```
+
+Skip fetching if the S3 copy is already complete. For local weights, follow [upload instructions](docs/running.md#put-the-weights-in-s3). For EC2, use `bin/drip-ai ec2 apply --yes` after its configuration and approval. SageMaker races several endpoints, so multiple lanes can bill during startup; keep `start` running until losing lanes are gone.
+
+A private or gated download stays in the user's own terminal: they run `bin/drip-ai fetch Org/Name` without `--yes` and enter the token at the hidden prompt. Never request a token in chat or put secrets in command arguments, logs, or committed files. Use the existing SSM credential and client-link mechanisms described in [client configuration](docs/connect-clients.md).
+
+If `StartedBy` names another identity, stop and report the owner. Use `--take-over` or `--force` only when the user names the other person who approved; the user must type each endpoint name in their own terminal. Never bypass ownership checks or open public inbound ports.
+
+## Connect and verify
+
+Have the user run `bin/drip-ai sagemaker tunnel` or `bin/drip-ai ec2 tunnel` in a dedicated terminal and leave it open. Tunnels temporarily link installed coding clients. Follow [client configuration](docs/connect-clients.md) to restart the relevant client, then run `bin/drip-ai smoke` with the tunnel open. A passing smoke test proves its API and parsed tool-call checks for this running model; it does not establish model quality or every client feature.
+
+## Shut down and report remaining costs
+
+Closing the tunnel restores client settings but leaves the server billing. With approval for shutdown, run `bin/drip-ai sagemaker stop --yes` to delete SageMaker endpoints, `bin/drip-ai ec2 stop` to pause EC2, or `bin/drip-ai ec2 destroy --yes` to delete EC2 and its disk. These commands unlink clients. SageMaker cannot pause; its stop command retries transitional endpoints every 15 seconds for up to 2 hours. If cleanup fails or is interrupted, check status and report endpoints that may still bill rather than claiming shutdown succeeded.
+
+Finish with `bin/drip-ai status --json` and the [resource and spend checks](docs/troubleshooting.md#check-what-you-spend). Report remaining S3 weights, retained storage and logs, and EBS disks on stopped EC2 instances. Delete retained data only when the user explicitly requests that deletion. Use [troubleshooting](docs/troubleshooting.md) for failed starts or cleanup, [SECURITY.md](SECURITY.md) for sensitive reports, and [LICENSE](LICENSE) for the project's license; model weights retain their own terms.
