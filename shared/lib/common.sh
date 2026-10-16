@@ -240,9 +240,10 @@ tf_root_dir() {
     fetch-model) echo "$repo_root/shared/fetch-model/terraform" ;;
     sagemaker) echo "$repo_root/sagemaker/terraform" ;;
     ec2) echo "$repo_root/ec2/terraform" ;;
+    lane-runner) echo "$repo_root/lane-runner/terraform" ;;
     bootstrap) echo "$repo_root/bootstrap" ;;
     *)
-      echo "drip-ai: unknown Terraform root '${1:-}'; use shared, fetch-model, sagemaker, ec2, or bootstrap" >&2
+      echo "drip-ai: unknown Terraform root '${1:-}'; use shared, fetch-model, sagemaker, ec2, lane-runner, or bootstrap" >&2
       return 1
       ;;
   esac

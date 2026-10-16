@@ -13,12 +13,21 @@ The EC2 backend: the script behind `bin/drip-ai ec2` and the Terraform root for 
 | Item | Value |
 | --- | --- |
 | Model | `model_source` in `terraform/terraform.tfvars` (or `TF_VAR_model_source`); `apply` refuses without it. `model_from_s3 = true` when it names a folder in the models bucket |
-| Variables | `project`, `region`, `instance_type` (default `g6e.2xlarge`), `root_volume_gb`, `model_source`, `model_from_s3`, `served_model_name`, `tensor_parallel_size`, `max_model_len`, `vllm_extra_args`, `hf_token_parameter` |
+| Variables | Core settings plus model, vLLM, and token settings listed below. |
 | Outputs | `instance_id`, `served_model_name`, `max_model_len`, `region` |
 | Needs | The shared stack: the models bucket and the API key |
 | Access | Egress-only security group; the instance role reads the models bucket and the API key (plus `hf_token_parameter` when set), and an explicit deny blocks every other SSM parameter; IMDSv2 with hop limit 1 |
 
+The variables are `project`, `region`, `instance_type`, `root_volume_gb`,
+`model_source`, `model_from_s3`, `served_model_name`, `tensor_parallel_size`,
+`max_model_len`, `max_num_seqs`, `vllm_extra_args`, and
+`hf_token_parameter`.
+
 The boot script runs once per instance and reads the API key then. A changed model or vLLM flag changes the rendered boot script, so the next `apply` replaces the instance; a rotated key does not, which is why [docs/ec2.md](../docs/ec2.md#start-the-server) shows the `-replace` command.
+
+`max_num_seqs` optionally sets vLLM's maximum active sequences. Leave it
+`null` to use the pinned vLLM default. The launch rejects
+`--no-enable-prefix-caching`, so vLLM V1 prefix caching remains enabled.
 
 ## Tests
 

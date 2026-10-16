@@ -51,6 +51,9 @@ docker run -d --name vllm --restart unless-stopped \
   --served-model-name '${served_model_name}' \
   --tensor-parallel-size ${tensor_parallel_size} \
   --max-model-len ${max_model_len} \
+%{ if max_num_seqs != null ~}
+  --max-num-seqs ${max_num_seqs} \
+%{ endif ~}
   ${vllm_extra_args}
 
 echo "bootstrap: vllm container started; first load downloads weights and can take several minutes"

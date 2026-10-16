@@ -23,6 +23,7 @@ STATE_ROOTS = {
     "fetch-model": "shared/fetch-model/terraform",
     "sagemaker": "sagemaker/terraform",
     "ec2": "ec2/terraform",
+    "lane-runner": "lane-runner/terraform",
 }
 ROUTED_SCRIPTS = ("sagemaker/start.sh", "sagemaker/endpoint.sh", "ec2/server.sh", "shared/models.sh",
                   "shared/clients.sh", "shared/fetch-model/fetch-model.sh", "shared/check.sh")
