@@ -31,6 +31,11 @@ For a synthetic example, 20 billion parameters at 2 bytes per parameter require 
 
 If vLLM logs an out-of-memory error, lower `max_model_len` first.
 
+The EC2 backend also exposes the optional `max_num_seqs` setting for the
+maximum active sequences. Leave it `null` to use the pinned vLLM default. The
+launch does not pass `--no-enable-prefix-caching`, so vLLM V1 prefix caching
+stays enabled.
+
 ## Model profiles
 
 Coding clients need parsed tool calls, and reasoning models may need thinking separated from the answer. The correct flags depend on the exact model release. The public `shared/model-profiles/profiles.json` is an empty JSON object, so **configure a local profile before starting SageMaker**.

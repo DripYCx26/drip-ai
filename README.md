@@ -120,6 +120,7 @@ The guides cover the complete workflow:
 - [Run a model](docs/running.md): download or upload, start, tunnel, test, and stop.
 - [SageMaker](docs/sagemaker.md): configuration, endpoint races, monitoring, and cleanup.
 - [EC2](docs/ec2.md): configuration, Session Manager, and pause or deletion.
+- [Lane runner](lane-runner/README.md): always-on ranked build lanes beside a configurable model endpoint.
 - [Model configuration](docs/models.md): memory sizing, profiles, parsers, and context length.
 - [Connect clients](docs/connect-clients.md): temporary configuration and recovery.
 - [Troubleshooting](docs/troubleshooting.md): failed starts, credentials, cleanup, and spend.

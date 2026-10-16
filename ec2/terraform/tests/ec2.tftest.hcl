@@ -14,6 +14,7 @@ variables {
   served_model_name    = "drip-coder"
   tensor_parallel_size = 1
   max_model_len        = 65536
+  max_num_seqs         = null
   vllm_extra_args      = ["--enable-auto-tool-choice", "--tool-call-parser", "example_tool"]
   hf_token_parameter   = ""
 }
@@ -138,6 +139,39 @@ run "user_data_reads_the_api_key_by_name_and_pins_the_image" {
     ])
     error_message = "User data must read the API key by name, pull the pinned image, and carry no token line without hf_token_parameter."
   }
+}
+
+run "max_num_seqs_is_optional_and_reaches_vllm" {
+  command = plan
+
+  variables {
+    max_num_seqs = 48
+  }
+
+  assert {
+    condition     = strcontains(aws_instance.server.user_data, "--max-num-seqs 48")
+    error_message = "max_num_seqs must be passed to the vLLM launch when configured."
+  }
+}
+
+run "prefix_caching_cannot_be_disabled" {
+  command = plan
+
+  variables {
+    vllm_extra_args = ["--no-enable-prefix-caching"]
+  }
+
+  expect_failures = [var.vllm_extra_args]
+}
+
+run "prefix_caching_cannot_be_disabled_with_a_value" {
+  command = plan
+
+  variables {
+    vllm_extra_args = ["--no-enable-prefix-caching=true"]
+  }
+
+  expect_failures = [var.vllm_extra_args]
 }
 
 run "hf_token_parameter_cannot_alias_managed" {

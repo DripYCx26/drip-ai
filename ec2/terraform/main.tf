@@ -131,6 +131,7 @@ resource "aws_instance" "server" {
     served_model_name    = var.served_model_name
     tensor_parallel_size = var.tensor_parallel_size
     max_model_len        = var.max_model_len
+    max_num_seqs         = var.max_num_seqs
     vllm_extra_args      = join(" ", var.vllm_extra_args)
   })
 

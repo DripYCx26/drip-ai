@@ -57,10 +57,29 @@ variable "max_model_len" {
   default     = 65536
 }
 
+variable "max_num_seqs" {
+  description = "Optional vLLM maximum number of active sequences. Null leaves the vLLM default."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.max_num_seqs == null || (var.max_num_seqs >= 1 && floor(var.max_num_seqs) == var.max_num_seqs)
+    error_message = "max_num_seqs must be null or a positive whole number."
+  }
+}
+
 variable "vllm_extra_args" {
   description = "Extra vLLM serve flags, such as the tool-call parser for the chosen model."
   type        = list(string)
   default     = []
+
+  validation {
+    condition = alltrue([
+      for arg in var.vllm_extra_args :
+      arg != "--no-enable-prefix-caching" && !startswith(arg, "--no-enable-prefix-caching=")
+    ])
+    error_message = "Do not disable vLLM V1 prefix caching with --no-enable-prefix-caching."
+  }
 }
 
 variable "hf_token_parameter" {

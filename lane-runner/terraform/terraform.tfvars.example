@@ -1,0 +1,28 @@
+# Copy this file to terraform.tfvars and replace every synthetic value before
+# an approved plan. This example contains no credentials.
+project = "drip-ai"
+region  = "us-east-1"
+
+runner_instance_type  = "m7i.2xlarge"
+runner_root_volume_gb = 200
+runner_image          = "registry.example.invalid/example/lane-runner:review"
+
+# The queue is the ranked artifact produced by the lane source repository.
+ranked_queue_uri = "s3://example-ranked-queue/seeds/library/build_rank.json"
+runner_instance_profile_arn = "arn:aws:iam::123456789012:instance-profile/drip-ai-lane-runner"
+
+# The lane consumer is on by default. Set false only to stop its consumer.
+lane_runner_enabled = true
+lane_count          = 30
+
+# Include /v1 when the provider expects it. This can point at a self-hosted
+# vLLM server or any OpenAI-compatible hosted endpoint.
+model_endpoint_url = "https://model.example.invalid/v1"
+model_name         = "example-model"
+
+# This is a parameter ARN, never the secret value. Empty means no key header.
+model_endpoint_secret_parameter_arn = "arn:aws:ssm:us-east-1:123456789012:parameter/drip-ai/lane-model-api-key"
+
+# Optional Git provider token ARN. The image must use GIT_PUSH_TOKEN for its
+# remote helper; Terraform never writes the token into state or source files.
+git_push_secret_parameter_arn = "arn:aws:ssm:us-east-1:123456789012:parameter/drip-ai/git-push-token"
