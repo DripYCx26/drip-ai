@@ -1,26 +1,9 @@
-# Optional, tuning only. Copy to terraform.tfvars (gitignored) to change a default.
-# `bin/drip-ai sagemaker start` chooses the model per run and passes model_source,
-# model_from_s3, started_by, and vllm_model_args with -var, so do not set them here.
-# Keep instance_types on one line: start.sh reads it from this file for its fit
-# check and cost lines, and refuses a plan whose endpoints differ from it.
+# Optional. Copy to terraform.tfvars (gitignored) only to set the region explicitly.
+# Race tuning (regions, GPU classes, lanes, context window, vLLM flags) lives in the drip-ai
+# config file, not here: bin/drip-ai config show lists every key, and
+# bin/drip-ai config import-tfvars moves tuning an older terraform.tfvars still holds.
 
 # Keep region equal to the Region bin/drip-ai uses (DRIP_AI_REGION, default us-east-1):
 # the state bucket and the shared stack live there, and a value here overrides the
 # TF_VAR_region the helper exports.
 region = "us-east-1"
-
-# Raced in order: start creates one endpoint per type, keeps the first InService,
-# and deletes the others. 1 to 3 types; each bills per hour from creation until
-# deleted. The model must fit at least one configured type at its shipped precision.
-instance_types       = ["ml.p5en.48xlarge", "ml.p5e.48xlarge"]
-tensor_parallel_size = 8 # Must equal every type's GPU count.
-
-served_model_name = "drip-coder"
-# Context window in tokens; Codex gets the same value. Raising it needs free VRAM
-# for the KV cache, so check the endpoint log after the next start.
-max_model_len = 131072
-
-# The tool-call and reasoning parsers come from the model's profile in
-# shared/model-profiles/profiles.json. Flags here are added to it and win on a
-# flag both set. See docs/models.md for profile and flag configuration.
-vllm_extra_args = []

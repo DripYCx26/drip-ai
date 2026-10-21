@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Operator commands for the SageMaker endpoints: status, logs, tunnel, stop, and deploy. Design:
-# docs/DECISIONS.md, 2026-10-05 "Folders per backend, Terraform roots per stack", and 2026-10-06
-# "Race instance types". Bash 3.2 and 5.
+# docs/DECISIONS.md, 2026-10-05 "Folders per backend, Terraform roots per stack", 2026-10-07
+# "Create SageMaker endpoints through the AWS API", and 2026-10-09 "Plan, race, and learn in a
+# Python control core". Bash 3.2 and 5.
 #
-# Every endpoint named drip-ai or drip-ai-<lane> is a lane: start races one per instance_types
-# entry and keeps the first InService. sagemaker/start.sh sources this file for the lane and owner
-# functions above the CLI guard, so start and stop judge ownership one way. Sourced, it defines
-# functions and returns.
+# Every endpoint named drip-ai or drip-ai-<suffix> is a lane: start races drip-ai-<GPU class>-
+# <region>-<n> endpoints through the API and keeps the first InService; drip-ai-<type>-<n>,
+# drip-ai-<type>, and drip-ai are lanes earlier versions created. sagemaker/start.sh sources this
+# file for the lane and owner functions above the CLI guard, so start and stop judge ownership one
+# way. Sourced, it defines functions and returns. stop deletes endpoints only; the free models,
+# endpoint configurations, and log groups a race created stay for the next start, which reuses
+# them by content hash, until bin/drip-ai doctor cleans them up.
 #
 # Test hooks: DRIP_AI_TTY replaces /dev/tty for the typed endpoint name; DRIP_AI_STOP_POLL_SECONDS
 # and DRIP_AI_STOP_WAIT_SECONDS shorten stop's wait on a Creating endpoint; common.sh lists the rest.
@@ -16,25 +20,29 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../shared/lib/common.sh
 source "$repo_root/shared/lib/common.sh"
 
-# Lane endpoint names: drip-ai-<instance type> from sagemaker/terraform (var.project drip-ai), and
-# the single endpoint drip-ai that earlier versions created.
+# Lane endpoint names: drip-ai-<instance type>-<n> from sagemaker/terraform's lanes output
+# (var.project drip-ai), and drip-ai-<instance type> and drip-ai that earlier versions created.
 lane_name_pattern='^drip-ai(-[a-z0-9-]+)?$'
-# Lets the destroy plan pass model_source's validations; destroy reads only state.
-destroy_model_source=placeholder/for-destroy
+# The S3 lease a race holds from before its plan until it exits, so one race runs per account.
+race_lease=sagemaker-race
 endpoint_arn_pattern='^arn:aws[a-z-]*:sagemaker:[a-z0-9-]+:[0-9]{12}:endpoint/[A-Za-z0-9-]+$'
 tty_open=no
 # SageMaker refuses DeleteEndpoint while an endpoint is in one of these states ("Cannot update
 # in-progress endpoint", seen live 2026-10-06 while Creating); stop asks again every poll.
 delete_wait_statuses=" Creating Updating SystemUpdating RollingBack "
 stop_poll_seconds="${DRIP_AI_STOP_POLL_SECONDS:-15}"
+# Also how long a race that has a winner keeps asking to delete a loser that is still Creating.
 stop_wait_seconds="${DRIP_AI_STOP_WAIT_SECONDS:-7200}"
 # The lane endpoints stop_lanes has not seen gone yet; its signal trap names them.
 stop_pending=""
-# yes when the user passed --yes: stop_lanes then answers Terraform's destroy question.
+# yes when the user passed --yes: it answers start's race question; stop asks nothing.
 assume_yes=no
+# How long stop waits for a race on this machine to exit after TERM, in one-second sleeps.
+stop_race_wait_seconds=300
 
-# Prints VALUE in the AWS tag-value charset that sagemaker/terraform checks for started_by: ASCII
-# letters, digits, spaces, and _ . : / = + - @, at most 256 characters. Any other byte becomes '-'.
+# Prints VALUE in the AWS tag-value charset, for the StartedBy tag start puts on each endpoint:
+# ASCII letters, digits, spaces, and _ . : / = + - @, at most 256 characters. Any other byte becomes
+# '-'. sagemaker/start.sh relies on it holding no quote or backslash when it builds the tags' JSON.
 sanitize_tag_value() {
   local value
   value="$(printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9 _.:/=+@-' '-')"
@@ -163,11 +171,11 @@ read_lane_model() {
 # read_lanes REGION MY_STARTED_BY
 # Reads the owner of every lane endpoint. Sets lanes_mine and lanes_other (space-separated names;
 # untagged and unreadable ones count as other), lanes_other_text (the first other lane's holder
-# line), and lanes_listed (list_lanes' NAME, STATUS, ARN lines). Returns 1 when the endpoints cannot
-# be listed.
+# line), lanes_other_lines (NAME, tab, holder text per other lane), and lanes_listed (list_lanes'
+# NAME, STATUS, ARN lines). Returns 1 when the endpoints cannot be listed.
 read_lanes() {
   local listed name
-  lanes_mine="" lanes_other="" lanes_other_text="" lanes_listed=""
+  lanes_mine="" lanes_other="" lanes_other_text="" lanes_other_lines="" lanes_listed=""
   listed="$(list_lanes "$1")" || return 1
   lanes_listed="$listed"
   for name in $(cut -f1 <<<"$listed"); do
@@ -177,6 +185,7 @@ read_lanes() {
       mine) lanes_mine="$lanes_mine $name" ;;
       *)
         lanes_other="$lanes_other $name"
+        lanes_other_lines="$lanes_other_lines$name"$'\t'"$(endpoint_holder_text)"$'\n'
         [ -n "$lanes_other_text" ] || lanes_other_text="endpoint $name was $(endpoint_holder_text)"
         ;;
     esac
@@ -218,14 +227,13 @@ pick_lane() {
   return 1
 }
 
-# delete_orphan_endpoint NAME [CONFIRMED_ARN CONFIRMED_CREATED]
-# Runs after the destroy. The provider records an endpoint in state only once it is InService, so a
-# timed-out, Failed, or raced one outlives the destroy. Deletes NAME when it is the caller's, or when
-# its ARN and CreationTime match the confirmed ones, so a same-name replacement is refused; each
-# retry checks that again. While SageMaker refuses because the endpoint is Creating (or another
-# in-progress state), asks again every stop_poll_seconds for up to stop_wait_seconds. Waits until it
-# is gone; returns 1 while it still exists. Needs region_name and my_started_by.
-delete_orphan_endpoint() {
+# delete_lane_endpoint NAME [CONFIRMED_ARN CONFIRMED_CREATED]
+# Deletes NAME when it is the caller's, or when its ARN and CreationTime match the confirmed ones,
+# so a same-name replacement is refused; each retry checks that again. While SageMaker refuses
+# because the endpoint is Creating (or another in-progress state), asks again every
+# stop_poll_seconds for up to stop_wait_seconds. Waits until it is gone; returns 1 while it still
+# exists. Needs region_name and my_started_by.
+delete_lane_endpoint() {
   local confirmed_arn="${2:-}" confirmed_created="${3:-}" err_file reason waited_on="" started=$SECONDS
   [[ "$stop_poll_seconds" =~ ^[1-9][0-9]{0,4}$ ]] && [[ "$stop_wait_seconds" =~ ^[0-9]{1,6}$ ]] || {
     echo "sagemaker-endpoint: DRIP_AI_STOP_POLL_SECONDS and DRIP_AI_STOP_WAIT_SECONDS must be whole seconds" >&2
@@ -250,7 +258,7 @@ delete_orphan_endpoint() {
         fi
         ;;
     esac
-    [ -n "$waited_on" ] || echo "Endpoint $endpoint_name is $endpoint_status and not in Terraform state; deleting it."
+    [ -n "$waited_on" ] || echo "Deleting endpoint $endpoint_name ($endpoint_status)."
     aws sagemaker delete-endpoint --region "$region_name" --endpoint-name "$endpoint_name" 2>"$err_file" && break
     reason="$(awk 'NF { line = $0 } END { print line }' "$err_file")"
     case "$delete_wait_statuses" in
@@ -290,21 +298,16 @@ stop_interrupted() {
   exit "$1"
 }
 
-# The stop path, also run by `start --take-over`: unlinks every client, destroys the sagemaker root
-# (Terraform asks first unless assume_yes), then deletes every lane endpoint left outside state that
-# is the caller's or confirmed in lanes_confirmed. Returns 1 when the destroy fails or is declined,
-# or while a lane endpoint still exists. Needs region_name and my_started_by.
+# The stop path, also run by `start --take-over`: unlinks every client, then deletes every lane
+# endpoint in region_name that is the caller's or confirmed in lanes_confirmed, waiting until each
+# is gone. Someone else's endpoint that was not confirmed is left alone, named. Returns 1 while a
+# lane endpoint it should delete still exists. Needs region_name and my_started_by.
 stop_lanes() {
-  local listed name arn created status=0
-  # "not linked" is a success exit; only a real failure warns, and the destroy still runs.
+  local listed name arn created holder status=0
+  # "not linked" is a success exit; only a real failure warns, and the deletes still run.
   unlink_all_clients
-  if ! tf_approved "$assume_yes" sagemaker destroy -var "model_source=$destroy_model_source" \
-    -var "started_by=$my_started_by"; then
-    echo "sagemaker-endpoint: destroy failed or was declined; check with: bin/drip-ai sagemaker status" >&2
-    return 1
-  fi
   if ! listed="$(list_lanes "$region_name")"; then
-    echo "sagemaker-endpoint: could not list the endpoints left after the destroy; check with: bin/drip-ai sagemaker status" >&2
+    echo "sagemaker-endpoint: could not list the endpoints to delete in $region_name; nothing was deleted there. Check with: bin/drip-ai sagemaker status" >&2
     return 1
   fi
   stop_pending=" $(cut -f1 <<<"$listed" | tr '\n' ' ')"
@@ -314,7 +317,15 @@ stop_lanes() {
   for name in $(cut -f1 <<<"$listed"); do
     arn="" created=""
     read -r arn created < <(awk -v name="$name" '$1 == name { print $2, $3; exit }' <<<"${lanes_confirmed:-}") || true
-    if delete_orphan_endpoint "$name" "$arn" "$created"; then
+    if [ -z "$arn" ] && [ "${stop_leave_others:-no}" = yes ]; then
+      holder="$(awk -F'\t' -v name="$name" '$1 == name { print $2; exit }' <<<"${lanes_other_lines:-}")"
+      if [ -n "$holder" ]; then
+        echo "Leaving endpoint $name alone: it was $holder."
+        stop_pending="${stop_pending/ $name / }"
+        continue
+      fi
+    fi
+    if delete_lane_endpoint "$name" "$arn" "$created"; then
       stop_pending="${stop_pending/ $name / }"
     else
       status=1
@@ -329,23 +340,28 @@ stop_lanes() {
 
 usage() {
   cat <<'EOF_USAGE'
-Usage: sagemaker/endpoint.sh status            each drip-ai endpoint's state and who started it
-       sagemaker/endpoint.sh logs              last 30 minutes of the serving endpoint's logs
-       sagemaker/endpoint.sh tunnel [--no-link | --smoke]
-                                               serve 127.0.0.1:$DRIP_AI_PORT (default 8000) through
-                                               sagemaker/proxy.py; links Codex, Claude Code, and
-                                               opencode once InService, and unlinks them on exit;
-                                               --smoke runs the smoke test once they link
+Usage: sagemaker/endpoint.sh status            each drip-ai endpoint's state and who started it, in
+                                               the home region and every configured region
+       sagemaker/endpoint.sh logs [--endpoint NAME]
+                                               last 30 minutes of the serving endpoint's logs
+       sagemaker/endpoint.sh tunnel [--no-link | --no-codex-link | --smoke] [--region R]
+                                    [--endpoint NAME] [--detach]
+                                               serve 127.0.0.1:<port> (ports.base, default 8000)
+                                               through sagemaker/proxy.py; links the clients in
+                                               clients.link once InService, and unlinks them on exit;
+                                               --smoke runs the smoke test once they link; --detach
+                                               keeps it running in the background
        sagemaker/endpoint.sh stop [--force] [--yes]
-                                               unlink the clients, destroy the sagemaker root (asks first),
-                                               then delete every drip-ai endpoint left outside Terraform
-                                               state, waiting out one that is still Creating;
-                                               --force plus each typed name for someone else's
+                                               end a race running on this machine, unlink the clients,
+                                               and delete every drip-ai endpoint of yours in each
+                                               configured region (waiting out one still Creating);
+                                               anyone else's is left alone unless --force and you type
+                                               its name
        sagemaker/endpoint.sh deploy <folder> [--take-over] [--yes]
                                                upload models/<folder>/ and start it (asks before spending);
                                                refuses before uploading when an endpoint exists, unless --take-over
-logs and tunnel follow the one InService endpoint, or the only one; they refuse while a race runs.
---yes answers Terraform's and start's own question; it never types an endpoint name.
+logs and tunnel follow --endpoint, else the one InService endpoint, or the only one; they refuse
+while a race runs. --yes answers start's own question; it never types an endpoint name.
 EOF_USAGE
 }
 
@@ -358,34 +374,48 @@ load_context() {
   my_started_by="$(sanitize_tag_value "$drip_caller_arn_value")"
 }
 
+# Every drip-ai endpoint in each region lane_regions names, its state, and who started it.
 status_command() {
-  local listed name
+  local listed name regions region
   load_context
-  listed="$(list_lanes "$region_name")" || endpoint_fail "could not list the SageMaker endpoints in $region_name"
-  [ -n "$listed" ] || { echo "No drip-ai endpoint in $region_name (nothing bills for one)."; return 0; }
-  for name in $(cut -f1 <<<"$listed"); do
-    read_endpoint_owner "$region_name" "$my_started_by" "$name"
-    case "$endpoint_ownership" in
-      absent) continue ;;
-      unknown) endpoint_fail "could not read endpoint $name: $endpoint_read_error" ;;
-    esac
-    echo "Endpoint $name in $region_name: $endpoint_status, created ${endpoint_created:-unknown}"
-    if [ "$endpoint_ownership" = mine ]; then
-      echo "  started by $endpoint_owner (you)"
-    elif [ -n "$endpoint_owner" ]; then
-      echo "  started by $endpoint_owner (someone else)"
-    else
-      echo "  started by unknown (no StartedBy tag)"
-    fi
-    [ "$endpoint_status" != Failed ] || aws sagemaker describe-endpoint --region "$region_name" \
-      --endpoint-name "$name" --query FailureReason --output text
+  regions="$(lane_regions)" || endpoint_fail "could not read the configured regions"
+  for region in $regions; do
+    region_name="$region"
+    listed="$(list_lanes "$region_name")" || endpoint_fail "could not list the SageMaker endpoints in $region_name"
+    [ -n "$listed" ] || { echo "No drip-ai endpoint in $region_name (nothing bills for one)."; continue; }
+    for name in $(cut -f1 <<<"$listed"); do
+      read_endpoint_owner "$region_name" "$my_started_by" "$name"
+      case "$endpoint_ownership" in
+        absent) continue ;;
+        unknown) endpoint_fail "could not read endpoint $name: $endpoint_read_error" ;;
+      esac
+      echo "Endpoint $name in $region_name: $endpoint_status, created ${endpoint_created:-unknown}"
+      if [ "$endpoint_ownership" = mine ]; then
+        echo "  started by $endpoint_owner (you)"
+      elif [ -n "$endpoint_owner" ]; then
+        echo "  started by $endpoint_owner (someone else)"
+      else
+        echo "  started by unknown (no StartedBy tag)"
+      fi
+      [ "$endpoint_status" != Failed ] || aws sagemaker describe-endpoint --region "$region_name" \
+        --endpoint-name "$name" --query FailureReason --output text
+    done
   done
 }
 
 logs_command() {
-  local lane
+  local lane=""
+  case "$#:${1:-}" in
+    0:) ;;
+    2:--endpoint) lane="$2" ;;
+    *) usage >&2; exit 1 ;;
+  esac
   region_name="$(drip_region)" || exit 1
-  pick_lane "$region_name" || exit 1
+  if [ -n "$lane" ]; then
+    [[ "$lane" =~ $lane_name_pattern ]] || endpoint_fail "--endpoint must name a drip-ai endpoint"
+  else
+    pick_lane "$region_name" || exit 1
+  fi
   aws logs tail "/aws/sagemaker/Endpoints/$lane" --region "$region_name" --since 30m
 }
 
@@ -411,17 +441,34 @@ run_proxy() {
     --endpoint "$endpoint_name" --model "$lane_model" --port "${DRIP_AI_PORT:-8000}"
 }
 
+# tunnel [--no-link | --no-codex-link | --smoke] [--region R] [--endpoint NAME] [--detach]
+# Serves one endpoint on the port shared/drip_ai/serve.py picks, registered as this shell, and
+# links the clients once it is InService. --region and --endpoint pick an endpoint outside the home
+# region or beside others; the API key is that region's. --detach reruns it in the background.
 tunnel_command() {
-  local key_parameter lane lane_model lane_window status=0
-  case "$#:${1:-}" in
-    0:) ;;
-    1:--no-link) DRIP_AI_LINK_CLIENTS=none ;;
-    1:--no-codex-link) DRIP_AI_CODEX_LINK=0 ;;
-    1:--smoke) tunnel_smoke=yes ;;
-    *) usage >&2; exit 1 ;;
-  esac
+  local key_parameter=/drip-ai/api-key lane="" lane_model lane_window status=0 detach=no passthrough=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-link) export DRIP_AI_LINK_CLIENTS=none; passthrough+=("$1") ;;
+      --no-codex-link) DRIP_AI_CODEX_LINK=0; passthrough+=("$1") ;;
+      --smoke) tunnel_smoke=yes; passthrough+=("$1") ;;
+      --region) [ $# -ge 2 ] || { usage >&2; exit 1; }; export DRIP_AI_REGION="$2"; passthrough+=("$1" "$2"); shift ;;
+      --endpoint) [ $# -ge 2 ] || { usage >&2; exit 1; }; lane="$2"; passthrough+=("$1" "$2"); shift ;;
+      --detach) detach=yes ;;
+      *) usage >&2; exit 1 ;;
+    esac
+    shift
+  done
+  if [ "$detach" = yes ]; then
+    exec python3 -I "$repo_root/shared/drip_ai/serve.py" detach --log "tunnel-$(date +%s)" -- \
+      bash "$repo_root/sagemaker/endpoint.sh" tunnel ${passthrough[@]+"${passthrough[@]}"}
+  fi
   load_context
-  pick_lane "$region_name" || exit 1
+  if [ -n "$lane" ]; then
+    [[ "$lane" =~ $lane_name_pattern ]] || endpoint_fail "--endpoint must name a drip-ai endpoint"
+  else
+    pick_lane "$region_name" || exit 1
+  fi
   read_endpoint_owner "$region_name" "$my_started_by" "$lane"
   case "$endpoint_ownership" in
     absent) endpoint_fail "no endpoint $endpoint_name in $region_name; start one with: bin/drip-ai sagemaker start" ;;
@@ -430,19 +477,46 @@ tunnel_command() {
   esac
   read_lane_model "$region_name" "$endpoint_config" ||
     endpoint_fail "could not read the served model name and context window of endpoint $endpoint_name"
-  key_parameter="$(tf_output shared api_key_parameter)" ||
-    endpoint_fail "could not read api_key_parameter from the shared Terraform root"
-  [[ "$key_parameter" =~ ^/[A-Za-z0-9_./-]+$ ]] ||
-    endpoint_fail "the api_key_parameter output is not a parameter name"
+  serve_prepare sagemaker "$region_name" "$endpoint_name" || { status=$?; [ "$status" -eq 2 ] && exit 0; exit 1; }
   tunnel_with_link "$lane_model" "$lane_window" endpoint_in_service run_proxy || status=$?
   exit "$status"
 }
 
-# Destroys only the sagemaker root, then deletes every lane endpoint the destroy left behind.
-# Someone else's endpoint (or one whose owner cannot be read) needs --force and its typed name;
-# Terraform then shows the plan and asks for yes.
+# Ends a live race before stop lists anything. A race on this machine gets TERM, which makes it
+# delete its own lanes and exit; stop waits up to stop_race_wait_seconds for that, then deletes
+# whatever is left itself. A race on another machine is refused, naming it. A lease that expired,
+# or whose process is gone, is no race.
+end_live_race() {
+  local waited=0
+  lease_holder "$race_lease" || endpoint_fail "could not read the $race_lease lease; nothing was deleted"
+  [ -n "$lease_holder_pid" ] && [ "$lease_holder_expired" = no ] || return 0
+  [ "$lease_holder_host" = "$(uname -n)" ] ||
+    endpoint_fail "a race started by $lease_holder_arn is running on $lease_holder_host (pid $lease_holder_pid, lease until $lease_holder_expires); stop it there or wait for it to end; nothing was deleted"
+  pid_alive "$lease_holder_pid" || return 0
+  kill -TERM "$lease_holder_pid" 2>/dev/null ||
+    endpoint_fail "could not signal the race on this machine (pid $lease_holder_pid, started by $lease_holder_arn); nothing was deleted"
+  echo "Ending the race (pid $lease_holder_pid); it deletes its own lanes before it exits."
+  while pid_alive "$lease_holder_pid" && [ "$waited" -lt "$stop_race_wait_seconds" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if pid_alive "$lease_holder_pid"; then
+    echo "The race (pid $lease_holder_pid) is still deleting its lanes after $((stop_race_wait_seconds / 60)) minutes; deleting them here too."
+  fi
+}
+
+# Prints the regions stop and status cover: the home region, then every configured race region.
+lane_regions() {
+  local configured
+  configured="$(drip_config regions)" || return 1
+  printf '%s\n' "$region_name" $configured | awk 'NF && !seen[$0]++' | tr '\n' ' '
+}
+
+# Ends a live race, then deletes every lane endpoint of the caller's in each region lane_regions
+# names. Someone else's endpoint (or one whose owner cannot be read) is left alone and named,
+# unless --force and its typed name. Exits 1 while an endpoint of yours still exists.
 stop_command() {
-  local force=no argument
+  local force=no argument regions region status=0
   for argument in "$@"; do
     case "$argument" in
       --force) force=yes ;;
@@ -451,18 +525,28 @@ stop_command() {
     esac
   done
   load_context
-  read_lanes "$region_name" "$my_started_by" ||
-    endpoint_fail "could not list the SageMaker endpoints in $region_name; nothing was destroyed"
-  if [ -n "$lanes_other" ]; then
-    [ "$force" = yes ] ||
-      endpoint_fail "$lanes_other_text; it is not yours to stop. To destroy it anyway, rerun with --force and type the endpoint name"
-    confirm_other_lanes || endpoint_fail "the typed name did not match $endpoint_name; nothing was destroyed"
-    close_tty
-  fi
-  [ -n "$lanes_mine$lanes_other" ] ||
-    echo "No drip-ai endpoint in $region_name; destroying what is left of the sagemaker root."
-  stop_lanes || exit 1
-  echo "The sagemaker root is destroyed and no drip-ai endpoint exists; the weights in the S3 models bucket stay and bill for storage."
+  end_live_race
+  regions="$(lane_regions)" || endpoint_fail "could not read the configured regions; nothing was deleted"
+  for region in $regions; do
+    region_name="$region"
+    if ! read_lanes "$region_name" "$my_started_by"; then
+      echo "sagemaker-endpoint: could not list the SageMaker endpoints in $region_name; nothing was deleted there" >&2
+      status=1
+      continue
+    fi
+    lanes_confirmed=""
+    if [ -n "$lanes_other" ] && [ "$force" = yes ]; then
+      confirm_other_lanes || endpoint_fail "the typed name did not match $endpoint_name; nothing more was deleted"
+    fi
+    if [ -z "$lanes_mine$lanes_other" ]; then
+      echo "No drip-ai endpoint in $region_name."
+      continue
+    fi
+    stop_leave_others=yes stop_lanes || status=1
+  done
+  close_tty
+  [ "$status" -eq 0 ] || exit 1
+  echo "No drip-ai endpoint of yours exists in ${regions% }; the weights in the S3 models bucket stay and bill for storage. bin/drip-ai doctor lists the free models, configurations, and log groups races left."
 }
 
 # Runs before the upload, which can push hundreds of GB. No endpoint: returns. Any endpoint, yours
@@ -503,7 +587,7 @@ command="${1:-}"
 shift || true
 case "$command" in
   status) [ $# -eq 0 ] || { usage >&2; exit 1; }; status_command ;;
-  logs) [ $# -eq 0 ] || { usage >&2; exit 1; }; logs_command ;;
+  logs) logs_command "$@" ;;
   tunnel) tunnel_command "$@" ;;
   stop) stop_command "$@" ;;
   deploy) deploy_command "$@" ;;
