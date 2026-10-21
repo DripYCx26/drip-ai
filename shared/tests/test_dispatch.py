@@ -69,6 +69,8 @@ class DispatchTest(unittest.TestCase):
             *[(["codex", c], f"shared/clients.sh|codex {c}") for c in ("link", "unlink", "status")],
             *[([c, "claude"], f"shared/clients.sh|{c} claude") for c in ("link", "unlink", "status")],
             (["status"], "shared/clients.sh|status"),
+            (["ec2", "reconfigure", "--", "--enforce-eager"], "ec2/server.sh|reconfigure -- --enforce-eager"),
+            (["serve", "--region", "us-east-2"], "sagemaker/endpoint.sh|tunnel --detach --region us-east-2"),
         ]
         files = {script: recorder(script) for script in ROUTED_SCRIPTS}
         with StubRepo(files=files) as repo:
@@ -82,13 +84,47 @@ class DispatchTest(unittest.TestCase):
             self.assertEqual(repo.calls(), [])
             for args in ([], ["bogus"], ["sagemaker", "bogus"], ["ec2", "bogus"], ["models", "bogus"],
                          ["codex", "bogus"], ["init", "--force"], ["setup", "--force"], ["up", "--force"],
-                         ["up", "a", "b"]):
+                         ["up", "a", "b"], ["race", "bogus"], ["capacity", "bogus"], ["plan"], ["logs"]):
                 self.assertEqual(repo.run("bin/drip-ai", *args).returncode, 2, args)
             (repo.root / "ec2" / "server.sh").unlink()
             missing = repo.run("bin/drip-ai", "ec2", "status")
             self.assertEqual(missing.returncode, 1)
             self.assertIn("ec2/server.sh not found", missing.stderr)
             self.assertEqual(repo.run("bin/drip-ai", "help").returncode, 0)
+
+    def test_routes_the_control_core_commands(self):
+        programs = {"shared/drip_ai/cli.py": "core", "sagemaker/race.py": "race", "ec2/capacity.py": "capacity",
+                    "shared/drip_ai/serve.py": "serve"}
+        routes = [
+            (["plan", "Org/Model", "--explain"], ("core", ["plan", "Org/Model", "--explain", "--home-region", REGION])),
+            (["config", "show", "--explain"], ("core", ["config", "show", "--explain"])),
+            (["config", "set", "race.max_lanes=3"], ("core", ["config", "set", "race.max_lanes=3"])),
+            (["learn", "show"], ("core", ["learn", "show"])),
+            (["doctor", "--json"], ("core", ["doctor", "--home-region", REGION, "--json"])),
+            (["runtime", "probe", "--docker"], ("core", ["runtime", "probe", "--docker"])),
+            (["logs", "drip-ai-h200-us-east-2-1", "--region", "us-east-2", "--follow"],
+             ("core", ["logs", "drip-ai-h200-us-east-2-1", "--region", "us-east-2", "--follow"])),
+            (["logs", "drip-ai-x-1"], ("core", ["logs", "drip-ai-x-1", "--region", REGION])),
+            (["race", "status", "--json"], ("race", ["status", "--json"])),
+            (["race", "resume", "r1", "--yes"], ("race", ["resume", "r1", "--yes"])),
+            (["capacity", "search", "--class", "h200"], ("capacity", ["search", "--class", "h200", "--home-region",
+                                                                      REGION])),
+            (["capacity", "buy", "cb-0123456789abcdef", "--region", REGION, "--yes"],
+             ("capacity", ["buy", "cb-0123456789abcdef", "--region", REGION, "--yes"])),
+            (["serve", "list"], ("serve", ["list"])),
+            (["serve", "stop", "--port", "8001"], ("serve", ["stop", "--port", "8001"])),
+        ]
+        with StubRepo() as repo:
+            for path, tool in programs.items():
+                repo.install_stub(path, tool)
+                repo.stub(tool)
+            for args, (tool, argv) in routes:
+                with self.subTest(args):
+                    before = len(repo.calls())
+                    result = repo.run("bin/drip-ai", *args, env=ENV)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    [call] = repo.calls()[before:]
+                    self.assertEqual((call.tool, call.argv), (tool, argv))
 
     def script_setup(self, repo, bucket_missing, apply_exit=0):
         repo.stub("aws", "--version", stdout="aws-cli/2.37.9 Python/3.12.6 Linux/6.1 exe/x86_64\n")
@@ -104,8 +140,9 @@ class DispatchTest(unittest.TestCase):
     def setup_files(self):
         placeholders = {f"{d}/.keep": "" for d in ["bootstrap", *STATE_ROOTS.values()]}
         # The stub init records no backend, so seed what a real init leaves; `tf` then skips a second init.
-        placeholders["shared/terraform/.terraform/terraform.tfstate"] = json.dumps(
-            {"version": 3, "backend": {"type": "s3", "config": {"bucket": BUCKET}}})
+        for root in ("shared/terraform", "sagemaker/terraform"):
+            placeholders[f"{root}/.terraform/terraform.tfstate"] = json.dumps(
+                {"version": 3, "backend": {"type": "s3", "config": {"bucket": BUCKET}}})
         return placeholders
 
     def test_setup_applies_the_shared_stack_after_every_init_and_auto_approves_only_with_yes(self):
@@ -125,12 +162,13 @@ class DispatchTest(unittest.TestCase):
         self.assertEqual(bool([a for argv in terraform for a in argv if "auto-approve" in a]), bool(yes))
         bootstrap_apply = [f"-chdir={repo.root}/bootstrap", "apply", *approve]
         shared_apply = [f"-chdir={repo.root}/shared/terraform", "apply", *approve]
+        foundation_apply = [f"-chdir={repo.root}/sagemaker/terraform", "apply", *approve]
         applies = [argv for argv in terraform if "apply" in argv]
-        self.assertEqual(applies, [bootstrap_apply, shared_apply] if bucket_missing else [shared_apply])
+        self.assertEqual(applies, ([bootstrap_apply] if bucket_missing else []) + [shared_apply, foundation_apply])
         inits = [argv[0] for argv in terraform if "init" in argv and f"-backend-config=bucket={BUCKET}" in argv]
         self.assertEqual(inits, [f"-chdir={repo.root}/{d}" for d in STATE_ROOTS.values()])
         last_init = max(i for i, argv in enumerate(terraform) if "init" in argv)
-        self.assertEqual(terraform[last_init + 1:], [shared_apply])
+        self.assertEqual(terraform[last_init + 1:], [shared_apply, foundation_apply])
         self.assertIn("Next: bin/drip-ai fetch <Org/Name>", result.stdout)
 
     def test_setup_fails_without_a_next_step_when_the_shared_apply_is_declined(self):
@@ -211,6 +249,28 @@ class UpTest(unittest.TestCase):
                             stdout)
             self.assertEqual(repo.calls(), [])
 
+    def test_up_follows_the_endpoint_the_race_kept_in_another_region(self):
+        with StubRepo(files=self.FILES) as repo:
+            runs = repo.home / ".local" / "state" / "drip-ai" / "runs"
+            runs.mkdir(parents=True)
+            (runs / "20261009T170203Z-a1b2c3.json").write_text(json.dumps({
+                "run_id": "20261009T170203Z-a1b2c3", "status": "won", "winner": "drip-ai-h200-us-east-2-1",
+                "winner_region": "us-east-2"}))
+            log = repo.home / "routes.log"
+            proc = repo.popen("bin/drip-ai", "up", "Org/Model", env={"ROUTE_LOG": str(log)},
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, start_new_session=True)
+            deadline = time.monotonic() + 30
+            while "endpoint" not in (log.read_text() if log.exists() else ""):
+                self.assertIsNone(proc.poll())
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.1)
+            time.sleep(0.5)
+            os.killpg(proc.pid, signal.SIGINT)
+            proc.communicate(timeout=30)
+            self.assertEqual(log.read_text().splitlines()[1],
+                             "endpoint tunnel --smoke --region us-east-2 --endpoint drip-ai-h200-us-east-2-1")
+
     def test_up_stops_when_start_fails(self):
         with StubRepo(files=self.FILES) as repo:
             log = repo.home / "routes.log"
@@ -225,6 +285,32 @@ class CheckScriptTest(unittest.TestCase):
 
     def make_repo(self):
         return StubRepo(files={f"{d}/.keep": "" for d in [*self.ROOTS, "shared/modules/conventions"]})
+
+    def test_check_public_refuses_a_model_choice_before_any_other_step(self):
+        cases = {
+            "private profiles": ({"shared/model-profiles/profiles.json": '{"x": {"vllm_args": [], "source": "https://e"}}'},
+                                 "shared/model-profiles/profiles.json is not {}"),
+            "a model_type key": ({"shared/model-profiles/profiles.json": "{}",
+                                  "shared/catalog/extra.json": '{"model_type": "x"}'},
+                                 "shared/catalog/extra.json has key model_type"),
+            "a repo id key": ({"shared/model-profiles/profiles.json": "{}",
+                               "shared/catalog/extra.json": '{"tuned": {"Org/Model@abc1234": 1}}'},
+                              "shared/catalog/extra.json has key tuned.Org/Model@abc1234"),
+        }
+        for label, (files, message) in cases.items():
+            with self.subTest(label), self.make_repo() as repo:
+                for path, text in files.items():
+                    repo.write(repo.root / path, text)
+                result = repo.run("shared/check.sh", "--public")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(message, result.stderr)
+                self.assertIn("check: FAILED at public tree", result.stderr)
+                self.assertEqual(repo.calls(), [])
+        with self.make_repo() as repo:
+            repo.write(repo.root / "shared/model-profiles/profiles.json", "{}")
+            repo.stub("terraform", "fmt", exit=3)
+            result = repo.run("shared/check.sh", "--public")
+            self.assertIn("check: FAILED at fmt shared/modules/conventions", result.stderr)
 
     def test_check_script_stops_at_first_failure(self):
         with self.make_repo() as repo:

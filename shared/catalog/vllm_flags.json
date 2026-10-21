@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "about": "vLLM serve flags the engine sets or checks. since is the first vLLM release believed to accept the flag; every since value is unverified and gates only a runtime whose vLLM version is known (runtimes.json); null means unknown, so only runtimes.json evidence supports the flag. class: correctness changes numerics or what can be served, perf changes speed or capacity, parser changes output parsing. type is the value type; bool flags are bare.",
+  "flags": {
+    "--decode-context-parallel-size": {"since": "0.11.0", "class": "perf", "type": "int"},
+    "--dcp-comm-backend": {"since": null, "class": "correctness", "type": "string"},
+    "--kv-cache-dtype": {"since": "0.4.0", "class": "correctness", "type": "string"},
+    "--speculative-config": {"since": "0.8.0", "class": "perf", "type": "json"},
+    "--enable-prefix-caching": {"since": "0.4.0", "class": "perf", "type": "bool"},
+    "--async-scheduling": {"since": "0.10.1", "class": "perf", "type": "bool"},
+    "--max-num-batched-tokens": {"since": "0.2.0", "class": "perf", "type": "int"},
+    "--kv-offloading-backend": {"since": "0.11.1", "class": "perf", "type": "string"},
+    "--kv-offloading-size": {"since": "0.11.1", "class": "perf", "type": "int"},
+    "--gpu-memory-utilization": {"since": "0.2.0", "class": "perf", "type": "float"},
+    "--override-generation-config": {"since": "0.8.0", "class": "correctness", "type": "json"},
+    "--enable-auto-tool-choice": {"since": "0.6.0", "class": "parser", "type": "bool"},
+    "--tool-call-parser": {"since": "0.6.0", "class": "parser", "type": "string"},
+    "--reasoning-parser": {"since": "0.9.0", "class": "parser", "type": "string"}
+  },
+  "owned": ["--model", "--served-model-name", "--tensor-parallel-size", "--max-model-len"]
+}

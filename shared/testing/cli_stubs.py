@@ -175,6 +175,20 @@ class StubRepo:
         self._write_stub(self.root / relative, tool)
         self._tools.add(tool)
 
+    def put_in_front(self, tool: str, first, program: Path, *args: str) -> None:
+        """Runs the Python `program` for every `tool` call whose first argument is `first` (one word,
+        or a tuple of words), as `program ARGS... CALLS_LOG STUB TOOL_ARGV...`; the stub answers every
+        other call. The program answers the calls it fakes, appending a `Call` line to CALLS_LOG for
+        each, and execs STUB for the rest."""
+        path, stub = self._bin / tool, self._bin / f"{tool}.stub"
+        path.rename(stub)
+        words = [sys.executable, "-I", str(program), *args, str(self._state / "calls.jsonl"), str(stub)]
+        firsts = "|".join(shlex.quote(word) for word in ((first,) if isinstance(first, str) else first))
+        path.write_text(f'#!/bin/sh\ncase "$1" in\n  {firsts}) exec '
+                        + " ".join(shlex.quote(word) for word in words) + ' "$@" ;;\nesac\n'
+                        + f'exec {shlex.quote(str(stub))} "$@"\n')
+        path.chmod(0o755)
+
     def skip_sleeps(self) -> None:
         """Puts SLEEP_SOURCE first on PATH; `sleeps()` lists the seconds asked for. A fake that must
         keep running uses REAL_SLEEP."""

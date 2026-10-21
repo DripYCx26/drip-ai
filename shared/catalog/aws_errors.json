@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "about": "Ordered patterns that map AWS CLI stderr to one error class; the first match wins and no match is unknown. A pattern with operations applies only to those calls (service operation). absent is the only class that allows a create, so each absent pattern is the exact not-found message of the calls it names: only Could not find endpoint means an endpoint is absent.",
+  "classes": {
+    "credentials": "Stop every mutating call, poll the caller identity, and tell the user to sign in again",
+    "absent": "The named resource does not exist",
+    "quota": "An account limit refused the request",
+    "capacity": "AWS has no machine for the request right now",
+    "throttle": "Too many requests; back off",
+    "busy": "The resource is in a state that refuses the change until it ends",
+    "conflict": "A resource of that name already exists",
+    "transient": "The call may or may not have reached AWS; ask again",
+    "denied": "The caller lacks permission",
+    "invalid": "AWS refused the request as malformed or unsupported",
+    "unknown": "No pattern matched"
+  },
+  "patterns": [
+    {"class": "credentials", "regex": "[Ss]ession has expired|ExpiredToken|Token has expired|[Ss]ecurity token included in the request is (expired|invalid)|Unable to locate credentials|Unable to load SSO token|Error loading SSO Token|InvalidClientTokenId|UnrecognizedClientException|reauthenticate using"},
+    {"class": "absent", "operations": ["sagemaker describe-endpoint", "sagemaker delete-endpoint"], "regex": "Could not find endpoint(?! configuration)"},
+    {"class": "absent", "operations": ["sagemaker describe-endpoint-config", "sagemaker delete-endpoint-config"], "regex": "Could not find endpoint configuration"},
+    {"class": "absent", "operations": ["sagemaker describe-model", "sagemaker delete-model"], "regex": "Could not find model"},
+    {"class": "absent", "operations": ["logs describe-log-streams", "logs get-log-events", "logs filter-log-events", "logs put-retention-policy", "logs delete-log-group", "logs list-tags-for-resource"], "regex": "The specified log group does not exist"},
+    {"class": "absent", "operations": ["iam get-role"], "regex": "NoSuchEntity"},
+    {"class": "quota", "regex": "ResourceLimitExceeded|ServiceQuotaExceeded|LimitExceededException"},
+    {"class": "capacity", "regex": "InsufficientInstanceCapacity|Unable to provision requested ML compute capacity|InsufficientCapacity"},
+    {"class": "throttle", "regex": "Throttling|ThrottlingException|Rate exceeded|TooManyRequests|RequestLimitExceeded|SlowDown"},
+    {"class": "busy", "regex": "Cannot update in-progress|OperationAborted|ConcurrentModification"},
+    {"class": "conflict", "regex": "already existing|already exists|ResourceAlreadyExistsException|EntityAlreadyExists"},
+    {"class": "transient", "regex": "Read timeout|Connect timeout|[Cc]onnection was closed|Could not connect to the endpoint URL|EndpointConnectionError|InternalFailure|InternalError|InternalServerError|ServiceUnavailable|\\(50[0-9]\\)|timed out|gave no answer"},
+    {"class": "denied", "regex": "AccessDenied|UnauthorizedOperation|not authorized to perform"},
+    {"class": "invalid", "regex": "ValidationException|ValidationError|InvalidParameter|MalformedPolicy|Unknown options|Invalid"}
+  ]
+}

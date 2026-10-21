@@ -1,0 +1,14 @@
+{
+  "about": "Synthetic config.json for sizing tests: an mla_dsa architecture with one MTP draft layer. Not a real model.",
+  "model_type": "example_mla_dsa",
+  "architectures": ["GlmMoeDsaForCausalLM"],
+  "num_hidden_layers": 78,
+  "num_nextn_predict_layers": 1,
+  "kv_lora_rank": 512,
+  "qk_rope_head_dim": 64,
+  "index_head_dim": 128,
+  "num_attention_heads": 64,
+  "hidden_size": 6144,
+  "max_position_embeddings": 1048576,
+  "quantization_config": {"quant_method": "fp8"}
+}

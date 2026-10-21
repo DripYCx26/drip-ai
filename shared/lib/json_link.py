@@ -9,7 +9,11 @@ trailing commas, duplicate keys) is refused with the keys to add by hand.
 
 Claude Code reads the key through `apiKeyHelper`, the same SSM command Codex runs, so it never
 touches disk. opencode has no command hook: `link` writes the key, read from stdin, to a 0600 file
-in a 0700 folder and points `{file:...}` at it; `unlink` deletes it. One stdlib-only file, run with
+in a 0700 folder and points `{file:...}` at it; `unlink` deletes it. opencode takes one provider
+per tunnel (`--provider drip-ai-<region>` while several run, each with its own record, lock, and
+key file) and sets its top-level model only with `--set-default-model`. The link never writes
+opencode's `compaction`: opencode applies it to every model of every provider, so a buffer sized
+for this window would change how every other model compacts. One stdlib-only file, run with
 `python3 -I`.
 """
 
@@ -57,6 +61,7 @@ AUTO_COMPACT_FLOOR = 100000
 OUTPUT_TOKEN_CAP = 16384
 MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:-]*")
 API_KEY = re.compile(r"[!-~]+")
+PROVIDER_NAME = re.compile(r"drip-ai(-[a-z0-9]+)*")
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,8 @@ class LinkRequest:
     owner_pid: int
     api_key_command: str  # Claude Code's apiKeyHelper; empty for opencode
     key_file: Path | None  # opencode's key file; None for Claude Code
+    provider: str = PROVIDER
+    set_default_model: bool = False  # opencode: also point the top-level model at this provider
 
     @property
     def output_tokens(self) -> int:
@@ -80,6 +87,7 @@ class LinkRequest:
 class ClientPaths:
     home: Path
     config_name: str
+    record_suffix: str = ""  # "-<suffix>" for an opencode provider other than drip-ai
 
     @property
     def config(self) -> Path:
@@ -87,11 +95,16 @@ class ClientPaths:
 
     @property
     def sidecar(self) -> Path:
-        return self.home / SIDECAR_NAME
+        return self.home / SIDECAR_NAME.replace(".json", f"{self.record_suffix}.json")
 
     @property
     def lock(self) -> Path:
-        return self.home / LOCK_NAME
+        return self.home / LOCK_NAME.replace(".lock", f"{self.record_suffix}.lock")
+
+
+def provider_suffix(provider: str) -> str:
+    """"" for drip-ai, "-us-east-2" for drip-ai-us-east-2: what tells one provider's files apart."""
+    return provider[len(PROVIDER):]
 
 
 def _absolute_env(environ: dict, name: str) -> Path | None:
@@ -113,18 +126,18 @@ def _config_root(environ: dict) -> Path:
     return Path(value) if value and os.path.isabs(value) else _home(environ) / ".config"
 
 
-def claude_paths(environ: dict) -> ClientPaths:
+def claude_paths(environ: dict, provider: str = PROVIDER) -> ClientPaths:
     """$CLAUDE_CONFIG_DIR when set, else $HOME/.claude (code.claude.com/docs/en/env-vars)."""
     return ClientPaths(_absolute_env(environ, "CLAUDE_CONFIG_DIR") or _home(environ) / ".claude",
                        "settings.json")
 
 
-def opencode_paths(environ: dict) -> ClientPaths:
-    return ClientPaths(_config_root(environ) / "opencode", "opencode.json")
+def opencode_paths(environ: dict, provider: str = PROVIDER) -> ClientPaths:
+    return ClientPaths(_config_root(environ) / "opencode", "opencode.json", provider_suffix(provider))
 
 
-def opencode_key_file(environ: dict) -> Path:
-    return _config_root(environ) / "drip-ai" / "opencode-key"
+def opencode_key_file(environ: dict, provider: str = PROVIDER) -> Path:
+    return _config_root(environ) / "drip-ai" / f"opencode-key{provider_suffix(provider)}"
 
 
 def claude_entries(request: LinkRequest) -> list:
@@ -155,7 +168,7 @@ def opencode_entries(request: LinkRequest) -> list:
     """(key path, value) pairs for opencode.json (opencode.ai/docs/providers and /config.json)."""
     provider = {
         "npm": "@ai-sdk/openai-compatible",
-        "name": PROVIDER,
+        "name": request.provider,
         "options": {
             "baseURL": f"http://127.0.0.1:{request.port}/v1",
             "apiKey": f"{{file:{request.key_file}}}",
@@ -169,7 +182,15 @@ def opencode_entries(request: LinkRequest) -> list:
             }
         },
     }
-    return [(("provider", PROVIDER), provider), (("model",), f"{PROVIDER}/{request.model}")]
+    entries = [(("provider", request.provider), provider)]
+    if request.set_default_model:
+        entries.append((("model",), f"{request.provider}/{request.model}"))
+    return entries
+
+
+def owned_paths(client: "Client", request: LinkRequest) -> tuple:
+    """Keys that refuse to link when present before link wrote them: opencode's own provider."""
+    return (("provider", request.provider),) if client.name == "opencode" else ()
 
 
 @dataclass(frozen=True)
@@ -179,16 +200,15 @@ class Client:
     paths: Callable[[dict], ClientPaths]
     entries: Callable[[LinkRequest], list]
     model_path: tuple  # the key status reports
-    owned_paths: tuple  # keys that refuse to link when present before link wrote them
     uses_key_file: bool
     overriding_files: tuple  # sibling configs the client reads after this one, so they win
 
 
 CLIENTS = {
     "claude": Client("claude", "Claude Code", claude_paths, claude_entries, ("env", "ANTHROPIC_MODEL"),
-                     (), False, ()),
+                     False, ()),
     "opencode": Client("opencode", "opencode", opencode_paths, opencode_entries, ("model",),
-                       (("provider", PROVIDER),), True, ("opencode.jsonc",)),
+                       True, ("opencode.jsonc",)),
 }
 
 
@@ -256,7 +276,7 @@ def dotted(path: tuple) -> str:
     return ".".join(path)
 
 
-def plan_link(data: dict, entries: list, client: Client, name: str) -> tuple:
+def plan_link(data: dict, entries: list, owned: tuple, name: str) -> tuple:
     """Return (new data, record entries, created container paths) or refuse."""
     new = json.loads(json.dumps(data))  # a deep copy; the caller's object stays as read
     record_entries, created = [], []
@@ -271,7 +291,7 @@ def plan_link(data: dict, entries: list, client: Client, name: str) -> tuple:
                 raise LinkError(f"{dotted(path[: depth + 1])} in {name} is not an object")
         entry = {"path": list(path), "written": value}
         if path[-1] in node:
-            if path in client.owned_paths:
+            if path in owned:
                 raise LinkError(
                     f"{name} already defines {dotted(path)} and drip-ai did not write it; "
                     "remove it by hand first"
@@ -307,7 +327,7 @@ def plan_unlink(data: dict, record: dict) -> tuple:
     return new, restored, notes
 
 
-def hand_snippet(entries: list, client: Client) -> str:
+def hand_snippet(entries: list, client: Client, provider: str = PROVIDER) -> str:
     """The keys link would write, as JSON to paste; opencode reads the key from the environment."""
     snippet: dict = {}
     for path, value in entries:
@@ -316,7 +336,7 @@ def hand_snippet(entries: list, client: Client) -> str:
             node = node.setdefault(key, {})
         node[path[-1]] = json.loads(json.dumps(value))
     if client.uses_key_file:
-        snippet["provider"][PROVIDER]["options"]["apiKey"] = "{env:DRIP_AI_API_KEY}"
+        snippet["provider"][provider]["options"]["apiKey"] = "{env:DRIP_AI_API_KEY}"
         return render(snippet) + 'Then run: export DRIP_AI_API_KEY="$(bin/drip-ai key)"'
     return render(snippet).rstrip("\n")
 
@@ -448,13 +468,14 @@ def link_request(args: argparse.Namespace, client: Client, environ: dict) -> Lin
         raise LinkError("--owner-pid must be > 0")
     command, key_file = "", None
     if client.uses_key_file:
-        key_file = opencode_key_file(environ)
+        key_file = opencode_key_file(environ, args.provider)
         validate_text("the opencode key file path", str(key_file))
         if "}" in str(key_file):
             raise LinkError("the opencode key file path has a '}', which opencode cannot read")
     else:
         command = _api_key_command(args.auth_command, args.auth_arg)
-    return LinkRequest(args.model, args.port, args.context_window, owner_pid, command, key_file)
+    return LinkRequest(args.model, args.port, args.context_window, owner_pid, command, key_file, args.provider,
+                       args.set_default_model)
 
 
 def _api_key_command(auth_command: str | None, auth_args: list) -> str:
@@ -518,9 +539,9 @@ def _link_plan(paths: ClientPaths, client: Client, request: LinkRequest, key: st
         data = parse_strict(text or "", paths.config_name)
     except NotStrictJson as error:
         raise LinkError(f"{error}; drip-ai edits only plain JSON. Add this by hand, and remove it "
-                        f"when the tunnel closes:\n{hand_snippet(entries, client)}") from error
+                        f"when the tunnel closes:\n{hand_snippet(entries, client, request.provider)}") from error
     warnings[:] = overriding_credentials(client, data)
-    new, record_entries, created = plan_link(data, entries, client, paths.config_name)
+    new, record_entries, created = plan_link(data, entries, owned_paths(client, request), paths.config_name)
     new_text = render(new)
     record = {
         "client": client.name,
@@ -555,7 +576,7 @@ def overriding_credentials(client: Client, data: dict) -> list:
 
 def run_unlink(args: argparse.Namespace, client: Client, paths: ClientPaths, environ: dict) -> str:
     if client.uses_key_file:
-        remove_key_file(opencode_key_file(environ))  # whatever happens next, the key goes
+        remove_key_file(opencode_key_file(environ, args.provider))  # whatever happens next, the key goes
     if not paths.home.is_dir():
         return f"{client.label} config not found; nothing to unlink"
     try:
@@ -627,6 +648,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     link = commands.add_parser("link", help="make the client default to the drip-ai model")
     link.add_argument("--client", choices=sorted(CLIENTS), required=True)
+    link.add_argument("--provider", default=PROVIDER, help="opencode: drip-ai or drip-ai-<suffix>")
     link.add_argument("--model", required=True)
     link.add_argument("--port", type=int, required=True)
     link.add_argument("--context-window", type=int, required=True)
@@ -635,10 +657,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--auth-arg", action="append", default=[], help="once per argument; --auth-arg=--flag"
     )
     link.add_argument("--owner-pid", type=int, help="process that owns the link (default: parent)")
+    link.add_argument("--set-default-model", action="store_true",
+                      help="opencode: also point the top-level model at this provider")
     link.set_defaults(run=run_link)
 
     unlink = commands.add_parser("unlink", help="restore what link changed")
     unlink.add_argument("--client", choices=sorted(CLIENTS), required=True)
+    unlink.add_argument("--provider", default=PROVIDER, help="opencode: the provider the link wrote")
     unlink.add_argument(
         "--force", action="store_true", help="drop a damaged link record or a stuck lock"
     )
@@ -646,6 +671,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = commands.add_parser("status", help="print whether the client is linked")
     status.add_argument("--client", choices=sorted(CLIENTS), required=True)
+    status.add_argument("--provider", default=PROVIDER, help="opencode: the provider to report")
     status.set_defaults(run=run_status)
     return parser
 
@@ -655,7 +681,11 @@ def main(argv: list | None = None) -> int:
     client = CLIENTS[args.client]
     environ = dict(os.environ)
     try:
-        paths = client.paths(environ)
+        if not PROVIDER_NAME.fullmatch(args.provider) or len(args.provider) > 63:
+            raise LinkError("--provider must be drip-ai or drip-ai-<letters and digits>")
+        if args.provider != PROVIDER and client.name != "opencode":
+            raise LinkError("--provider applies to opencode only")
+        paths = client.paths(environ, args.provider)
         message = args.run(args, client, paths, environ)
     except LinkError as error:
         print(f"json-link: {error}", file=sys.stderr)

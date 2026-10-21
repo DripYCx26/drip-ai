@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "about": "Patterns the log harvester reads from a vLLM server log. Value signals capture group 1; failure signals classify a startup that did not serve, first match in order.",
+  "values": {
+    "vllm_version": ["vLLM API server version ([0-9]+\\.[0-9]+\\.[0-9]+[A-Za-z0-9.+-]*)", "Initializing a V1 LLM engine \\(v([0-9]+\\.[0-9]+\\.[0-9]+[A-Za-z0-9.+-]*)\\)"],
+    "kv_pool_tokens": ["GPU KV cache size: ([0-9][0-9,]*) tokens"],
+    "available_kv_gib": ["Available KV cache memory: ([0-9]+(?:\\.[0-9]+)?) GiB"],
+    "estimated_max_model_len": ["estimated maximum model length is ([0-9]+)"]
+  },
+  "failures": [
+    {"outcome": "unknown_flag", "regex": "unrecognized arguments: (\\S+)"},
+    {"outcome": "kv_too_small", "regex": "larger than the available KV cache memory|larger than the maximum number of tokens that can be stored in KV cache"},
+    {"outcome": "oom", "regex": "CUDA out of memory|OutOfMemoryError"},
+    {"outcome": "download", "regex": "[Ee]rror downloading|[Ff]ailed to download|ModelDataDownload|No space left on device"},
+    {"outcome": "health", "regex": "did not pass the ping health check|health check"}
+  ]
+}

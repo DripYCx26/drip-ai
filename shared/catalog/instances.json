@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "about": "Hardware facts per instance type, keyed by the EC2 name. hbm_bytes_per_gpu carries its class: reported means a vendor or AWS figure, or nvidia-smi output; null means unknown. names maps each substrate to the type's name there.",
+  "instances": {
+    "p5en.48xlarge": {
+      "gpus": 8, "gpu": "H200", "sm_arch": "sm90",
+      "hbm_bytes_per_gpu": 150754820096, "hbm_class": "reported", "hbm_source": "nvidia-smi: 143,771 MiB",
+      "host_ram_gib": 2048, "vcpu": 192,
+      "names": {"sagemaker": "ml.p5en.48xlarge", "ec2": "p5en.48xlarge"}
+    },
+    "p5e.48xlarge": {
+      "gpus": 8, "gpu": "H200", "sm_arch": "sm90",
+      "hbm_bytes_per_gpu": 150754820096, "hbm_class": "reported", "hbm_source": "nvidia-smi: 143,771 MiB",
+      "host_ram_gib": 2048, "vcpu": 192,
+      "names": {"sagemaker": "ml.p5e.48xlarge", "ec2": "p5e.48xlarge"}
+    },
+    "p5.48xlarge": {
+      "gpus": 8, "gpu": "H100", "sm_arch": "sm90",
+      "hbm_bytes_per_gpu": 85520809984, "hbm_class": "reported", "hbm_source": "nvidia-smi: 81,559 MiB",
+      "host_ram_gib": 2048, "vcpu": 192,
+      "names": {"sagemaker": "ml.p5.48xlarge", "ec2": "p5.48xlarge"}
+    },
+    "p6-b200.48xlarge": {
+      "gpus": 8, "gpu": "B200", "sm_arch": "sm100",
+      "hbm_bytes_per_gpu": 180000000000, "hbm_class": "reported", "hbm_source": "AWS: 1,440 GB per instance",
+      "host_ram_gib": null, "vcpu": 192,
+      "names": {"sagemaker": "ml.p6-b200.48xlarge", "ec2": "p6-b200.48xlarge"}
+    },
+    "p6-b300.48xlarge": {
+      "gpus": 8, "gpu": "B300", "sm_arch": "sm103",
+      "hbm_bytes_per_gpu": 288000000000, "hbm_class": "reported", "hbm_source": "AWS: 2,304 GB per instance",
+      "host_ram_gib": null, "vcpu": null,
+      "names": {"sagemaker": "ml.p6-b300.48xlarge", "ec2": "p6-b300.48xlarge"}
+    },
+    "g6e.xlarge": {
+      "gpus": 1, "gpu": "L40S", "sm_arch": "sm89",
+      "hbm_bytes_per_gpu": 48000000000, "hbm_class": "reported", "hbm_source": "AWS: 48 GB per GPU",
+      "host_ram_gib": 32, "vcpu": 4,
+      "names": {"sagemaker": "ml.g6e.xlarge", "ec2": "g6e.xlarge"}
+    },
+    "g6e.2xlarge": {
+      "gpus": 1, "gpu": "L40S", "sm_arch": "sm89",
+      "hbm_bytes_per_gpu": 48000000000, "hbm_class": "reported", "hbm_source": "AWS: 48 GB per GPU",
+      "host_ram_gib": 64, "vcpu": 8,
+      "names": {"sagemaker": "ml.g6e.2xlarge", "ec2": "g6e.2xlarge"}
+    },
+    "g6e.12xlarge": {
+      "gpus": 4, "gpu": "L40S", "sm_arch": "sm89",
+      "hbm_bytes_per_gpu": 48000000000, "hbm_class": "reported", "hbm_source": "AWS: 48 GB per GPU",
+      "host_ram_gib": 384, "vcpu": 48,
+      "names": {"sagemaker": "ml.g6e.12xlarge", "ec2": "g6e.12xlarge"}
+    },
+    "g6e.48xlarge": {
+      "gpus": 8, "gpu": "L40S", "sm_arch": "sm89",
+      "hbm_bytes_per_gpu": 48000000000, "hbm_class": "reported", "hbm_source": "AWS: 48 GB per GPU",
+      "host_ram_gib": 1536, "vcpu": 192,
+      "names": {"sagemaker": "ml.g6e.48xlarge", "ec2": "g6e.48xlarge"}
+    }
+  },
+  "classes": {
+    "h200": ["p5en.48xlarge", "p5e.48xlarge"],
+    "h100": ["p5.48xlarge"],
+    "b200": ["p6-b200.48xlarge"],
+    "b300": ["p6-b300.48xlarge"],
+    "l40s-1": ["g6e.2xlarge", "g6e.xlarge"],
+    "l40s-4": ["g6e.12xlarge"],
+    "l40s-8": ["g6e.48xlarge"]
+  },
+  "class_order": ["h200", "b300", "b200", "h100", "l40s-8", "l40s-4", "l40s-1"]
+}

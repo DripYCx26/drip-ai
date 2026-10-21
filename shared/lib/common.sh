@@ -32,16 +32,6 @@ repo_root="${repo_root:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 # sagemaker/terraform/variables.tf and ec2/terraform/variables.tf.
 model_name_pattern='^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?$'
 
-# endpoint_hourly_price INSTANCE_TYPE
-# List prices from the costs table in README.md, checked 2026-10-05.
-endpoint_hourly_price() {
-  case "$1" in
-    ml.p5en.48xlarge) echo 'about $72.80/h' ;;
-    ml.p5.48xlarge) echo 'about $63.30/h' ;;
-    *) echo 'its hourly list price (not recorded in README.md)' ;;
-  esac
-}
-
 # ---------------------------------------------------------------------------------------------
 # Per-stack Terraform roots, shared S3 state, the one-at-a-time lease, and the client-linking tunnel.
 
@@ -51,6 +41,8 @@ lease_name_pattern='^[a-z0-9][a-z0-9-]{0,62}$'
 # The longest lease a caller may take; a crashed holder blocks others at most this long.
 lease_max_ttl_seconds=86400
 codex_provider=drip-ai
+# The API key's SSM name shared/modules/conventions gives it; the same name in every region.
+api_key_parameter_name=/drip-ai/api-key
 # The clients link and unlink know, in the order they run.
 link_client_names="codex claude opencode"
 # Filled by load_caller_identity; a $(...) subshell inherits them, so load once in the main shell.
@@ -62,6 +54,8 @@ linked_clients=""
 skipped_clients=""
 # Set to yes before tunnel_with_link to run the smoke test once, right after the clients link.
 tunnel_smoke=no
+# Set by serve_prepare: the registry record to remove on exit, and opencode's provider and options.
+serve_record="" serve_provider=drip-ai serve_default_model=no
 
 # One stdlib program for the JSON and date work the shell cannot do portably.
 drip_py() {
@@ -498,6 +492,32 @@ lease_acquire() {
   return 1
 }
 
+# lease_holder NAME
+# Reads the lease without taking it. Sets lease_holder_arn, lease_holder_host, lease_holder_pid,
+# lease_holder_expires, and lease_holder_expired (yes or no), all empty when no one holds it.
+# Returns 1, saying why, when it cannot be read.
+lease_holder() {
+  local name="${1:-}" lease_bucket lease_key lease_region lease_host dir now result
+  lease_holder_arn="" lease_holder_host="" lease_holder_pid="" lease_holder_expires="" lease_holder_expired=""
+  lease_target "$name" || return 1
+  now="$(drip_now_epoch)" || return 1
+  dir="$(mktemp -d)" || return 1
+  result="$(lease_get "$dir")"
+  case "$result" in
+    ok) ;;
+    missing) rm -rf "$dir"; return 0 ;;
+    *) lease_report_aws_error "$name" "reading" "$dir/get.err"; rm -rf "$dir"; return 1 ;;
+  esac
+  if ! IFS=$'\t' read -r lease_holder_arn lease_holder_host lease_holder_pid lease_holder_expires \
+    lease_holder_expired < <(drip_py lease-read "$dir/lease.json" "$now"); then
+    lease_holder_arn="" lease_holder_host="" lease_holder_pid="" lease_holder_expires="" lease_holder_expired=""
+    echo "drip-ai: lease $name: s3://$lease_bucket/$lease_key is unreadable; if no one is running $name, delete it with: aws s3 rm s3://$lease_bucket/$lease_key" >&2
+    rm -rf "$dir"
+    return 1
+  fi
+  rm -rf "$dir"
+}
+
 # lease_release NAME
 # Deletes the lease only while it still names the caller's ARN and host, whatever its pid, so a
 # later process (fetch-model.sh --watch) can release a lease a finished run left held. Deletes with
@@ -613,25 +633,44 @@ client_restart() {
   esac
 }
 
-# Prints the clients a tunnel links, space-separated: DRIP_AI_LINK_CLIENTS (a comma list of codex,
-# claude, and opencode, or all, or none; default all), less codex when DRIP_AI_CODEX_LINK=0.
+# drip_config KEY: prints one resolved drip-ai config value (shared/drip_ai/config.py): a list as
+# space-separated words, null as nothing. Returns 1, saying why, when the config is refused.
+drip_config() {
+  python3 -I "$repo_root/shared/drip_ai/cli.py" config get "$1"
+}
+
+# Prints the clients a tunnel links, space-separated: clients.link from the drip-ai config, which
+# DRIP_AI_LINK_CLIENTS (a comma list of codex, claude, and opencode, or all, or none) overrides;
+# default opencode, so Codex and Claude Code link only when named. DRIP_AI_CODEX_LINK=0 drops codex.
 # Returns 1, naming it, on an unknown client.
 link_client_selection() {
-  local requested="${DRIP_AI_LINK_CLIENTS:-all}" name selected=""
-  case "$requested" in
-    all) requested="${link_client_names// /,}" ;;
-    none) requested="" ;;
-  esac
-  for name in ${requested//,/ }; do
-    case " $link_client_names " in
-      *" $name "*) ;;
-      *) echo "drip-ai: DRIP_AI_LINK_CLIENTS names '$name'; use codex, claude, opencode, all, or none" >&2; return 1 ;;
-    esac
+  local requested name selected=""
+  requested="$(drip_config clients.link)" || return 1
+  for name in $requested; do
     [ "$name" != codex ] || [ "${DRIP_AI_CODEX_LINK:-1}" != 0 ] || continue
-    case " $selected " in *" $name "*) continue ;; esac
     selected="${selected:+$selected }$name"
   done
   echo "$selected"
+}
+
+# serve_prepare BACKEND REGION ENDPOINT
+# Asks shared/drip_ai/serve.py for this tunnel's port and opencode provider and registers this
+# shell ($$) as the tunnel. Sets DRIP_AI_PORT, serve_record, serve_provider, and
+# serve_default_model. Prints why and returns 1 on a refusal; returns 2 when a registered tunnel
+# already serves ENDPOINT, saying where.
+serve_prepare() {
+  local output name value
+  output="$(python3 -I "$repo_root/shared/drip_ai/serve.py" prepare --backend "$1" --region "$2" \
+    --endpoint "$3" --pid "$$")" || return 1
+  while IFS='=' read -r name value; do
+    case "$name" in
+      reuse) echo "A drip-ai tunnel already serves $3 ($value); nothing changed."; return 2 ;;
+      port) [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] && export DRIP_AI_PORT="$value" ;;
+      record) serve_record="$value" ;;
+      provider) [[ "$value" =~ ^drip-ai(-[a-z0-9-]+)?$ ]] && serve_provider="$value" ;;
+      default_model) serve_default_model="$value" ;;
+    esac
+  done <<<"$output"
 }
 
 # unlink_client CLIENT [--force]: restores what the link changed; "not linked" is a success.
@@ -640,6 +679,7 @@ unlink_client() {
   shift
   case "$client" in
     codex) python3 -I "$repo_root/shared/lib/codex_link.py" unlink --provider "$codex_provider" "$@" ;;
+    opencode) python3 -I "$repo_root/shared/lib/json_link.py" unlink --client opencode --provider "$serve_provider" "$@" ;;
     *) python3 -I "$repo_root/shared/lib/json_link.py" unlink --client "$client" "$@" ;;
   esac
 }
@@ -664,6 +704,8 @@ tunnel_cleanup() {
       echo "drip-ai: could not restore the $(client_label "$client") config; run bin/drip-ai unlink $client" >&2
   done
   stop_tunnel_child
+  [ -z "$serve_record" ] || rm -f "$serve_record"
+  serve_record=""
 }
 
 # Exits 0 when GET /v1/models on PORT answers 200 with KEY. printf is a builtin, so the key reaches
@@ -716,8 +758,10 @@ run_link_program() {
       python3 -I "$repo_root/shared/lib/json_link.py" "${args[@]}" --owner-pid "$owner"
       ;;
     *)
-      printf '%s\n' "$key" | python3 -I "$repo_root/shared/lib/json_link.py" link --client "$client" \
-        --model "$model" --port "$port" --context-window "$window" --owner-pid "$owner"
+      args=(link --client "$client" --model "$model" --port "$port" --context-window "$window"
+        --provider "$serve_provider")
+      [ "$serve_default_model" != yes ] || args+=(--set-default-model)
+      printf '%s\n' "$key" | python3 -I "$repo_root/shared/lib/json_link.py" "${args[@]}" --owner-pid "$owner"
       ;;
   esac
 }
@@ -776,14 +820,15 @@ link_clients() {
 # a background child in its own process group. Every 15 s for up to 60 min it checks that /v1/models
 # answers 200 with the API key and READY_FUNCTION returns 0, then links each installed client that
 # link_client_selection names to MODEL with CONTEXT_WINDOW (an empty MODEL or CONTEXT_WINDOW links
-# none). On exit, Ctrl-C, TERM, or HUP it unlinks exactly the clients it linked, then stops the
-# child. With tunnel_smoke=yes it runs shared/clients.sh smoke once after linking; a failed smoke
-# is reported and the tunnel stays open. Returns the child's exit code. Reads api_key_parameter from
-# the shared root's outputs. Replaces any caller trap on EXIT, INT, TERM, HUP.
+# none); opencode gets the provider and default-model choice serve_prepare set. On
+# exit, Ctrl-C, TERM, or HUP it unlinks exactly the clients it linked, stops the child, and removes
+# the registry record serve_prepare wrote. With tunnel_smoke=yes it runs shared/clients.sh smoke once after linking; a failed smoke
+# is reported and the tunnel stays open. Returns the child's exit code. Reads the API key from SSM
+# in the tunnel's region by its conventional name. Replaces any caller trap on EXIT, INT, TERM, HUP.
 tunnel_with_link() {
   local model="${1:-}" context_window="${2:-}" ready_function="${3:-}" port="${DRIP_AI_PORT:-8000}" link=yes
   local poll="${DRIP_AI_TUNNEL_POLL_SECONDS:-15}" wait_seconds="${DRIP_AI_TUNNEL_WAIT_SECONDS:-3600}"
-  local region parameter="" key="" deadline status had_monitor=no clients
+  local region parameter="" key="" deadline status had_monitor=no clients holder
   shift 3 || { echo "drip-ai: tunnel_with_link needs MODEL CONTEXT_WINDOW READY_FUNCTION PROXY_COMMAND" >&2; return 1; }
   [ $# -gt 0 ] || { echo "drip-ai: tunnel_with_link needs a proxy command" >&2; return 1; }
   type "$ready_function" >/dev/null 2>&1 || { echo "drip-ai: no readiness check '$ready_function'" >&2; return 1; }
@@ -792,7 +837,8 @@ tunnel_with_link() {
     { echo "drip-ai: DRIP_AI_TUNNEL_POLL_SECONDS and DRIP_AI_TUNNEL_WAIT_SECONDS must be whole seconds" >&2; return 1; }
   # The readiness check sends the API key to whatever answers on the port, so it must be free.
   if drip_py port-accepts "$port"; then
-    echo "drip-ai: port $port is already in use; set DRIP_AI_PORT" >&2
+    holder="$(python3 -I "$repo_root/shared/drip_ai/serve.py" holder --port "$port" 2>/dev/null)" || holder=""
+    echo "drip-ai: port $port is already in use${holder:+ by $holder}; set DRIP_AI_PORT" >&2
     return 1
   fi
   region="$(drip_region)" || return 1
@@ -800,9 +846,9 @@ tunnel_with_link() {
   clients="$(link_client_selection)" || clients=""
   if [ -z "$clients" ]; then
     link=no
-    echo "No client links (DRIP_AI_LINK_CLIENTS=${DRIP_AI_LINK_CLIENTS:-all})."
+    echo "No client links (clients.link is empty; bin/drip-ai config set clients.link=codex,claude,opencode, or DRIP_AI_LINK_CLIENTS=all, links them)."
   elif [ -z "$model" ] || [ -z "$context_window" ] || ! load_caller_identity ||
-    ! parameter="$(tf_output shared api_key_parameter)" ||
+    ! parameter="$api_key_parameter_name" ||
     ! key="$(aws ssm get-parameter --region "$region" --name "$parameter" --with-decryption \
       --query Parameter.Value --output text)"; then
     link=no

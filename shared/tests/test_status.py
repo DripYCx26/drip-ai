@@ -2,7 +2,6 @@
 plus a reason for a section that cannot be read, and no key-shaped value anywhere."""
 
 import json
-import re
 import sys
 import unittest
 from pathlib import Path
@@ -14,13 +13,13 @@ from cli_stubs import StubRepo  # noqa: E402
 ACCOUNT = "111122223333"
 REGION = "eu-west-1"
 ENV = {"DRIP_AI_REGION": REGION}
-BUCKET = f"drip-ai-models-{ACCOUNT}"
+BUCKET = f"drip-ai-models-{ACCOUNT}-{REGION}"  # every region but us-east-1 suffixes the bucket
 KEY = "sk-CanaryApiKey0123456789abcdefghijklmnopqrstuvwxyz"
 LANE = "drip-ai-p5en-48xlarge"
 LANE_ARN = f"arn:aws:sagemaker:{REGION}:{ACCOUNT}:endpoint/{LANE}"
 ALICE = f"arn:aws:iam::{ACCOUNT}:user/alice"
 TASK_ARN = f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/drip-ai-fetch-model/0123456789abcdef"
-KEYS = {"region", "endpoints", "ec2", "fetches", "models", "clients", "errors"}
+KEYS = {"region", "endpoints", "ec2", "fetches", "models", "clients", "runs", "procs", "capacity_blocks", "errors"}
 
 
 def listing(prefix, files=(), folders=()):
@@ -70,6 +69,10 @@ def make_repo(failing=False):
     repo.stub("aws", "list-objects-v2", "models/mine/", stdout=listing("models/mine/", files=("config.json",)))
     repo.stub("aws", "s3", "cp", f"s3://{BUCKET}/models/Org/Big/drip-ai-fetch.json",
               stdout=json.dumps({"status": "copying", "files": []}))
+    repo.stub("aws", "ec2", "describe-capacity-reservations", stdout=json.dumps({"CapacityReservations": [
+        {"CapacityReservationId": "cr-0123456789abcdef0", "InstanceType": "p5en.48xlarge", "AvailabilityZone":
+         f"{REGION}a", "State": "active", "StartDate": "2026-10-06T11:30:00Z", "EndDate": "2026-10-07T11:30:00Z",
+         "AvailableInstanceCount": 1}]}))
     return repo
 
 
@@ -84,6 +87,9 @@ class StatusJsonTest(unittest.TestCase):
                 self.assertEqual(call.argv[call.argv.index("--region") + 1], REGION)
         report = json.loads(result.stdout)
         self.assertEqual(set(report), KEYS)
+        mutating = {"create-endpoint", "delete-endpoint", "create-model", "delete-model", "put-object", "delete-object",
+                    "purchase-capacity-block", "send-command", "run-task", "stop-task"}
+        self.assertFalse({c.argv[1] for c in repo.calls() if c.tool == "aws"} & mutating)
         return report
 
     def test_prints_every_section_and_no_key(self):
@@ -101,7 +107,35 @@ class StatusJsonTest(unittest.TestCase):
             self.assertEqual(report["models"], [{"name": "Org/Big", "source": "fetched", "fetch": "copying"},
                                                 {"name": "mine", "source": "uploaded", "fetch": None}])
             self.assertEqual(report["clients"], {"codex": "linked", "claude": "unlinked", "opencode": "unlinked"})
+            self.assertEqual(report["capacity_blocks"], [{
+                "reservation_id": "cr-0123456789abcdef0", "instance_type": "p5en.48xlarge", "zone": f"{REGION}a",
+                "state": "active", "start": "2026-10-06T11:30:00Z", "end": "2026-10-07T11:30:00Z", "available": 1}])
+            self.assertEqual((report["runs"], report["procs"]), ([], []))
             self.assertEqual(report["errors"], {})
+
+    def test_the_local_sections_show_this_machines_races_and_tunnels(self):
+        with make_repo() as repo:
+            runs = repo.home / ".local" / "state" / "drip-ai" / "runs"
+            runs.mkdir(parents=True)
+            (runs / "r1.json").write_text(json.dumps({
+                "run_id": "20261009T170203Z-a1b2c3", "status": "won", "pid": 2147483647, "pid_start": "x",
+                "winner": "drip-ai-h200-us-east-2-1", "winner_region": "us-east-2",
+                "lanes": [{"name": "drip-ai-h200-us-east-2-1", "region": "us-east-2", "state": "IN_SERVICE",
+                           "shown": "InService"}]}))
+            procs_dir = repo.home / ".local" / "state" / "drip-ai" / "procs"
+            procs_dir.mkdir(parents=True)
+            (procs_dir / "2147483647.json").write_text(json.dumps({
+                "pid": 2147483647, "start_time": "x", "port": 8002, "endpoint": "drip-ai-h200-us-east-2-1",
+                "region": "us-east-2", "provider": "drip-ai-us-east-2"}))
+            report = self.status(repo)
+            self.assertEqual(report["runs"], [{
+                "run_id": "20261009T170203Z-a1b2c3", "status": "won", "running": False,
+                "winner": "drip-ai-h200-us-east-2-1", "winner_region": "us-east-2",
+                "lanes": [{"name": "drip-ai-h200-us-east-2-1", "region": "us-east-2", "state": "IN_SERVICE",
+                           "status": "InService"}]}])
+            self.assertEqual(report["procs"], [{"pid": 2147483647, "port": 8002, "endpoint": "drip-ai-h200-us-east-2-1",
+                                                "region": "us-east-2", "provider": "drip-ai-us-east-2",
+                                                "running": False}])
 
     def test_an_unreadable_section_is_null_with_its_reason(self):
         with make_repo(failing=True) as repo:

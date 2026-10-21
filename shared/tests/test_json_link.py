@@ -35,9 +35,9 @@ CLAUDE_ORIGINAL = '{\n    "theme": "dark",\n    "env": {"FOO": "1", "ANTHROPIC_M
 OPENCODE_ORIGINAL = '{"$schema": "https://opencode.ai/config.json", "model": "anthropic/claude-sonnet-4-5"}\n'
 
 
-def link_argv(client, model="drip-coder", owner_pid=None):
+def link_argv(client, model="drip-coder", owner_pid=None, extra=()):
     argv = ["link", "--client", client, "--model", model, "--port", "8000",
-            "--context-window", "131072", "--owner-pid", str(owner_pid or os.getpid())]
+            "--context-window", "131072", "--owner-pid", str(owner_pid or os.getpid()), *extra]
     if client == "claude":
         argv += ["--auth-command", "/bin/sh", *[f"--auth-arg={arg}" for arg in AUTH_ARGS]]
     return argv
@@ -73,8 +73,8 @@ class HomeCase(unittest.TestCase):
         self.assertEqual((code, err), (0, ""), out)
         return out
 
-    def unlink(self):
-        code, out, err = self.run_tool("unlink", "--client", self.client)
+    def unlink(self, *extra):
+        code, out, err = self.run_tool("unlink", "--client", self.client, *extra)
         self.assertEqual((code, err), (0, ""), out)
         return out
 
@@ -204,7 +204,7 @@ class OpencodeLinkTest(HomeCase):
 
     def test_link_writes_the_provider_and_unlink_restores_the_bytes(self):
         self.config.write_text(OPENCODE_ORIGINAL)
-        self.link()
+        self.link(extra=["--set-default-model"])
         data = self.data()
         self.assertEqual(data["model"], "drip-ai/drip-coder")
         self.assertEqual(data["$schema"], "https://opencode.ai/config.json")
@@ -238,7 +238,7 @@ class OpencodeLinkTest(HomeCase):
 
     def test_a_change_made_after_linking_is_kept(self):
         self.config.write_text(OPENCODE_ORIGINAL)
-        self.link()
+        self.link(extra=["--set-default-model"])
         data = self.data()
         data["model"] = "openai/gpt-5"
         data["theme"] = "tokyonight"
@@ -258,7 +258,7 @@ class OpencodeLinkTest(HomeCase):
         (bin_dir / "opencode").chmod(0o755)
         with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}:/usr/bin:/bin"}):
             self.link()
-            self.assertEqual(set(self.data()), {"provider", "model"})
+            self.assertEqual(set(self.data()), {"provider"})
             self.unlink()
         self.assertFalse(self.dir.exists())
         self.assertFalse(self.key_file.exists())
@@ -307,6 +307,48 @@ class OpencodeLinkTest(HomeCase):
         self.unlink()
         self.assertFalse(self.config.exists())
         self.assert_no_link_files()
+
+    def test_the_top_level_model_is_left_alone_unless_asked(self):
+        self.config.write_text(OPENCODE_ORIGINAL)
+        self.link()
+        self.assertEqual(self.data()["model"], "anthropic/claude-sonnet-4-5")
+        self.unlink()
+        self.assertEqual(self.config.read_text(), OPENCODE_ORIGINAL)
+
+    def test_the_link_never_writes_opencode_compaction(self):
+        # opencode applies compaction to every model of every provider: a buffer sized for this
+        # window would make a 200,000-token model compact on every turn.
+        original = {"$schema": "https://opencode.ai/config.json", "compaction": {"auto": True, "reserved": 31457}}
+        self.config.write_text(json.dumps(original))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            json_link.main(link_argv("opencode", extra=["--compact-at", "100000"]))
+        self.assertEqual(json.loads(self.config.read_text()), original)
+        self.assert_no_link_files()
+        self.link()
+        self.assertEqual(self.data()["compaction"], original["compaction"])
+        self.unlink()
+        self.assertEqual(json.loads(self.config.read_text()), original)
+
+    def test_a_second_provider_links_beside_the_first_with_its_own_files(self):
+        self.config.write_text(OPENCODE_ORIGINAL)
+        self.link()
+        second = link_argv("opencode", owner_pid=os.getppid(), extra=["--provider", "drip-ai-us-east-2"])
+        second[second.index("--port") + 1] = "8002"
+        code, out, err = self.run_tool(*second)
+        self.assertEqual((code, err), (0, ""), out)
+        providers = self.data()["provider"]
+        self.assertEqual(sorted(providers), ["drip-ai", "drip-ai-us-east-2"])
+        self.assertEqual(providers["drip-ai-us-east-2"]["options"]["baseURL"], "http://127.0.0.1:8002/v1")
+        self.assertTrue((self.dir / "drip-ai-link-us-east-2.json").exists())
+        self.assertTrue((self.home / ".config" / "drip-ai" / "opencode-key-us-east-2").exists())
+        self.unlink("--provider", "drip-ai-us-east-2")
+        self.assertEqual(sorted(self.data()["provider"]), ["drip-ai"])
+        self.assertTrue(self.key_file.exists())
+        self.unlink()
+        self.assertEqual(self.config.read_text(), OPENCODE_ORIGINAL)
+        code, _, err = self.run_tool("unlink", "--client", "claude", "--provider", "drip-ai-us-east-2")
+        self.assertEqual(code, 1)
+        self.assertIn("--provider applies to opencode only", err)
 
     def test_a_malformed_key_on_stdin_writes_nothing(self):
         code, _, err = self.run_tool(*link_argv("opencode"), stdin='sk-"quoted\n')

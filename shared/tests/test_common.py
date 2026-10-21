@@ -395,7 +395,8 @@ class TunnelTest(unittest.TestCase):
 
     def setUp(self):
         self.port = str(free_port())
-        self.env = {**ENV, "DRIP_AI_PORT": self.port}
+        # The default links opencode only; these tests link every installed one unless they say otherwise.
+        self.env = {**ENV, "DRIP_AI_PORT": self.port, "DRIP_AI_LINK_CLIENTS": "all"}
 
     def run_tunnel(self, repo, wait_for, extra_env=None):
         """Starts the tunnel, waits for `wait_for` in its output, sends SIGINT, and returns
@@ -465,10 +466,10 @@ class TunnelTest(unittest.TestCase):
                 ("json_link", ["link", "--client", "claude", "--model", "big-model", "--port", self.port,
                                "--context-window", "131072", "--auth-command", aws_path, *auth_args, *owner]),
                 ("json_link", ["link", "--client", "opencode", "--model", "big-model", "--port", self.port,
-                               "--context-window", "131072", *owner]),
+                               "--context-window", "131072", "--provider", "drip-ai", *owner]),
                 ("codex_link", ["unlink", "--provider", "drip-ai"]),
                 ("json_link", ["unlink", "--client", "claude"]),
-                ("json_link", ["unlink", "--client", "opencode"]),
+                ("json_link", ["unlink", "--client", "opencode", "--provider", "drip-ai"]),
             ])
             # The opencode key went in on stdin.
             self.assertEqual([c.stdin for c in calls_of(repo, "json_link", "opencode", "link")], [KEY + "\n"])
@@ -489,7 +490,8 @@ class TunnelTest(unittest.TestCase):
             self.assertEqual(returncode, 130, err)
             self.assertNotIn("Claude Code", out + err)
             unlinks = [c.argv for c in repo.calls() if c.tool in ("codex_link", "json_link") and c.argv[0] == "unlink"]
-            self.assertEqual(unlinks, [["unlink", "--provider", "drip-ai"], ["unlink", "--client", "opencode"]])
+            self.assertEqual(unlinks, [["unlink", "--provider", "drip-ai"],
+                                       ["unlink", "--client", "opencode", "--provider", "drip-ai"]])
 
     def test_tunnel_link_failure_leaves_the_other_clients_linked(self):
         with make_repo(**initialised("sagemaker/terraform", "shared/terraform")) as repo:
@@ -501,7 +503,7 @@ class TunnelTest(unittest.TestCase):
             self.assertEqual(returncode, 130, err)
             self.assertIn("Codex: linked (restart Codex)\nClaude Code: not linked\nopencode: linked", out)
             self.assertIn("already linked by pid 7", err)
-            unlinks = [c.argv[-1] for c in repo.calls() if c.tool in ("codex_link", "json_link") and c.argv[0] == "unlink"]
+            unlinks = [c.argv[2] for c in repo.calls() if c.tool in ("codex_link", "json_link") and c.argv[0] == "unlink"]
             self.assertEqual(unlinks, ["drip-ai", "opencode"])
 
     def test_tunnel_links_only_the_clients_named(self):
@@ -532,6 +534,28 @@ class TunnelTest(unittest.TestCase):
                 self.assertIn("No client links", result.stdout)
                 self.assertEqual(repo.calls(), [])
                 self.assertEqual("names 'cursor'" in result.stderr, "cursor" in extra_env["DRIP_AI_LINK_CLIENTS"])
+
+    def test_tunnel_links_only_opencode_by_default_never_codex_or_claude(self):
+        self.env = {k: v for k, v in self.env.items() if k != "DRIP_AI_LINK_CLIENTS"}
+        with make_repo(**initialised("sagemaker/terraform", "shared/terraform")) as repo:
+            self.script_tunnel(repo)
+            returncode, out, err, _, _ = self.run_tunnel(repo, "opencode: linked")
+            self.assertEqual(returncode, 130, err)
+            linked = [("codex" if c.tool == "codex_link" else c.argv[2])
+                      for c in repo.calls() if c.tool in ("codex_link", "json_link") and c.argv[0] == "link"]
+            self.assertEqual(linked, ["opencode"])
+        with make_repo() as repo:
+            repo.install_stub("shared/lib/codex_link.py", "codex_link")
+            repo.install_stub("shared/lib/json_link.py", "json_link")
+            user_config = repo.home / ".config" / "drip-ai" / "config.json"
+            user_config.parent.mkdir(parents=True)
+            user_config.write_text(json.dumps({"clients": {"link": []}}))
+            user_config.chmod(0o600)
+            result = repo.run("drive.sh", "tunnel_with_link", "big-model", "131072", "endpoint_in_service",
+                              "bash", "-c", "exit 3", env=self.env)
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertIn("No client links (clients.link is empty;", result.stdout)
+            self.assertEqual([c for c in repo.calls() if c.tool in ("codex_link", "json_link")], [])
 
     def test_tunnel_skips_codex_and_claude_when_auth_preflight_fails(self):
         with make_repo(**initialised("sagemaker/terraform", "shared/terraform")) as repo:
@@ -568,7 +592,7 @@ class TunnelTest(unittest.TestCase):
             result = repo.run("drive.sh", "tunnel_with_link", "big-model", "131072", "endpoint_in_service",
                               "bash", "-c", f"touch '{started}'", env={**ENV, "DRIP_AI_PORT": port}, timeout=20)
             self.assertEqual(result.returncode, 1, result.stderr)
-            self.assertIn(f"port {port} is already in use; set DRIP_AI_PORT", result.stderr)
+            self.assertRegex(result.stderr, rf"port {port} is already in use( by pid \d+ \(.+\))?; set DRIP_AI_PORT")
             self.assertFalse(started.exists())
             self.assertEqual([c for c in repo.calls() if c.tool in ("curl", "codex_link", "json_link")], [])
             self.assertEqual(calls_of(repo, "aws", "ssm"), [])

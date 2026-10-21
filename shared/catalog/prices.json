@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "about": "Hourly list prices used for planning, per substrate and instance type. Each is a reported figure recorded for one region on one date, not a quote; a type missing here has an unknown price, never zero.",
+  "sagemaker": {
+    "ml.p5en.48xlarge": {"usd_per_hour": 72.80, "recorded_region": "us-east-1", "checked": "2026-10-05"},
+    "ml.p5.48xlarge": {"usd_per_hour": 63.30, "recorded_region": "us-east-1", "checked": "2026-10-05"}
+  },
+  "ec2": {}
+}

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "about": "Attention family per architecture, and the KV-cache byte layouts sizing uses. An architecture not listed is gqa. replicated_across_tp: every tensor-parallel rank holds the whole KV cache, so only decode context parallelism (DCP) shards it. dcp_flags: flags every plan with DCP > 1 passes for that family; a runtime that cannot take them gets no DCP.",
+  "families": {
+    "mla_dsa": {
+      "architectures": ["GlmMoeDsaForCausalLM", "DeepseekV32ForCausalLM"],
+      "replicated_across_tp": true,
+      "dcp_flags": {"flags": {"--dcp-comm-backend": "ag_rs"}, "class": "measured",
+                    "evidence": "with DCP > 1, vLLM 0.30.0+amzn2023 in AWS's SageMaker image (server-sagemaker-cuda-v2.6.1) picks the a2a backend, and the FlashMLA sparse kernel raises NotImplementedError at startup; ag_rs served on 8xH200 with DCP 8, 2026-10-09"},
+      "layouts": {
+        "fp8": {"name": "fp8_ds_mla", "bytes_per_layer": 656, "indexer_bytes_per_layer": 132, "class": "reported",
+                "expects": {"kv_lora_rank": 512, "qk_rope_head_dim": 64, "index_head_dim": 128}},
+        "bf16": {"name": "bf16 latent", "formula": "mla", "dtype_bytes": 2, "indexer": true, "class": "derived"}
+      }
+    },
+    "mla": {
+      "architectures": ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM", "KimiK2ForCausalLM"],
+      "replicated_across_tp": true,
+      "layouts": {
+        "fp8": {"name": "fp8 latent", "formula": "mla", "dtype_bytes": 1, "indexer": false, "class": "modeled"},
+        "bf16": {"name": "bf16 latent", "formula": "mla", "dtype_bytes": 2, "indexer": false, "class": "derived"}
+      }
+    },
+    "gqa": {
+      "architectures": [],
+      "replicated_across_tp": false,
+      "layouts": {
+        "fp8": {"name": "fp8 k and v", "formula": "gqa", "dtype_bytes": 1, "class": "derived"},
+        "bf16": {"name": "bf16 k and v", "formula": "gqa", "dtype_bytes": 2, "class": "derived"}
+      }
+    }
+  }
+}

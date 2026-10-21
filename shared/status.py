@@ -12,17 +12,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+# `python3 -I` leaves this folder off sys.path; appended, so the package never shadows the stdlib.
+sys.path.append(str(Path(__file__).resolve().parent))
+from drip_ai import conventions, procs, state_dir  # noqa: E402
+
 AWS_TIMEOUT_SECONDS = 60
 LINK_TIMEOUT_SECONDS = 30
 LIB = Path(__file__).resolve().parent / "lib"
-# The same names as lane_name_pattern in sagemaker/endpoint.sh, the models bucket in
-# shared/modules/conventions, and the cluster in shared/fetch-model/terraform.
+# The same names as lane_name_pattern in sagemaker/endpoint.sh and the cluster in
+# shared/fetch-model/terraform; the models bucket comes from shared/drip_ai/conventions.py.
 LANE_NAME = re.compile(r"drip-ai(-[a-z0-9-]+)?")
 FETCH_CLUSTER = "drip-ai-fetch-model"
 STATUS_OBJECT = "drip-ai-fetch.json"
@@ -148,7 +153,7 @@ def fetches(region: str) -> tuple:
 def models(region: str) -> tuple:
     """Folders one or two levels under models/ holding drip-ai-fetch.json (fetched) or config.json
     (uploaded), the rule shared/models.sh list uses. `fetch` is the status object's status."""
-    bucket = f"drip-ai-models-{account_id(region)}"
+    bucket = conventions.models_bucket(account_id(region), region)
 
     def level(prefix: str) -> tuple:
         answer = aws(region, "s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix,
@@ -197,6 +202,43 @@ def clients(region: str) -> tuple:
     return states, error
 
 
+def runs(region: str) -> tuple:
+    """This machine's race journals, newest last: status, whether its process runs, and its lanes."""
+    found = []
+    for path in sorted(state_dir(dict(os.environ), "runs").glob("*.json")):
+        try:
+            journal = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        pid = journal.get("pid")
+        started = journal.get("pid_start")
+        running = isinstance(pid, int) and started is not None and procs.start_time(pid) == started
+        found.append({"run_id": text_or_none(journal.get("run_id")), "status": text_or_none(journal.get("status")),
+                      "running": bool(running), "winner": text_or_none(journal.get("winner")),
+                      "winner_region": text_or_none(journal.get("winner_region")),
+                      "lanes": [{"name": text_or_none(lane.get("name")), "region": text_or_none(lane.get("region")),
+                                 "state": text_or_none(lane.get("state")), "status": text_or_none(lane.get("shown"))}
+                                for lane in journal.get("lanes") or []]})
+    return found, None
+
+
+def tunnels(region: str) -> tuple:
+    """The tunnels drip-ai registered on this machine, and whether each still runs."""
+    return [{"pid": record.get("pid"), "port": record.get("port"), "endpoint": text_or_none(record.get("endpoint")),
+             "region": text_or_none(record.get("region")), "provider": text_or_none(record.get("provider")),
+             "running": live} for record, live in procs.records(dict(os.environ))], None
+
+
+def capacity_blocks(region: str) -> tuple:
+    answer = aws(region, "ec2", "describe-capacity-reservations", "--filters",
+                 "Name=reservation-type,Values=capacity-block", "Name=state,Values=active,scheduled,payment-pending")
+    return [{"reservation_id": text_or_none(r.get("CapacityReservationId")),
+             "instance_type": text_or_none(r.get("InstanceType")), "zone": text_or_none(r.get("AvailabilityZone")),
+             "state": text_or_none(r.get("State")), "start": text_or_none(r.get("StartDate")),
+             "end": text_or_none(r.get("EndDate")), "available": r.get("AvailableInstanceCount")}
+            for r in answer.get("CapacityReservations") or []], None
+
+
 def account_id(region: str) -> str:
     account = str(aws(region, "sts", "get-caller-identity").get("Account", ""))
     if not re.fullmatch(r"[0-9]{12}", account):
@@ -204,7 +246,8 @@ def account_id(region: str) -> str:
     return account
 
 
-SECTIONS = {"endpoints": endpoints, "ec2": ec2, "fetches": fetches, "models": models, "clients": clients}
+SECTIONS = {"endpoints": endpoints, "ec2": ec2, "fetches": fetches, "models": models, "clients": clients,
+            "runs": runs, "procs": tunnels, "capacity_blocks": capacity_blocks}
 
 
 def read(section, region: str) -> tuple:

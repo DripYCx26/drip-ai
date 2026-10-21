@@ -6,9 +6,10 @@ output "partition" {
   value = local.partition
 }
 
-# Weights uploaded or fetched land here under models/<name>/.
+# Weights uploaded or fetched land here under models/<name>/. Bucket names are global, so every
+# region other than us-east-1 gets its own bucket with the region appended.
 output "bucket_name" {
-  value = "${var.project}-models-${local.account_id}"
+  value = "${var.project}-models-${local.account_id}${var.region == "us-east-1" ? "" : "-${var.region}"}"
 }
 
 # Terraform state for every stack; created by bootstrap/. The suffix is the
@@ -61,4 +62,9 @@ output "sagemaker_image" {
 
 output "vllm_image" {
   value = local.vllm_image
+}
+
+# IAM names are account-global, so every region other than us-east-1 appends its region to them.
+output "global_name_suffix" {
+  value = var.region == "us-east-1" ? "" : "-${var.region}"
 }

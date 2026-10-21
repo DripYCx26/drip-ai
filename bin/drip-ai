@@ -25,24 +25,48 @@ usage() {
   cat <<'EOF_USAGE'
 Usage: bin/drip-ai <group> <command> [args]
 
-  setup [--yes]               create the state bucket if missing, init every root, then apply the shared stack (asks first)
+  setup [--yes]               create the state bucket if missing, init every root, then apply the shared stack and
+                              the SageMaker foundation in this region (asks first)
   init [--reconfigure]        init every root against your account's state bucket
   check                       run the repo gate (shared/check.sh)
   up [name] [--yes]           sagemaker start, then the tunnel, with a smoke test once the clients link;
                               Ctrl-C closes the tunnel, and the endpoint bills until sagemaker stop
-  sagemaker start [name] [--yes]
-                              start the endpoint from a model in S3 (asks before spending)
+  sagemaker start [name] [--yes] [--hours N] [--detach]
+                              race endpoints for a model in S3 across the configured regions and keep the
+                              first that serves (asks before spending); --hours caps a race with no winner
   sagemaker stop [--force] [--yes]
   sagemaker status|logs|watch|list
-  sagemaker tunnel [--no-link | --smoke]
-                              serve 127.0.0.1:8000 and link Codex, Claude Code, and opencode until it closes
+  sagemaker tunnel [--no-link | --smoke] [--region R] [--endpoint NAME] [--detach]
+                              serve 127.0.0.1:<ports.base> and link the clients in clients.link until it closes
   sagemaker deploy <folder> [--take-over] [--yes]
                               upload models/<folder>/ and start it (asks before spending);
                               refuses before uploading while any endpoint is running
   ec2 apply|destroy|start [--yes]
                               create, delete, or start the EC2 server from ec2/terraform/terraform.tfvars
   ec2 stop|status|logs
-  ec2 tunnel [--no-link]      serve 127.0.0.1:8000 and link the clients, as sagemaker tunnel does
+  ec2 reconfigure [-- FLAG...]
+                              rewrite the instance's vLLM flags in place and restart vLLM there
+  ec2 tunnel [--no-link]      serve 127.0.0.1:<ports.base> and link the clients, as sagemaker tunnel does
+  plan <name> [--explain] [--set KEY=VALUE]
+                              the serving plan per GPU class, with every setting's value, layer, and reason;
+                              reads only
+  config show [--explain] [--json] | get KEY | set KEY=VALUE... | import-tfvars [PATH]
+                              the layered drip-ai config; set writes your config file
+  race status [RUN_ID] [--json] | resume RUN_ID [--yes] | cancel RUN_ID [--yes]
+                              follow, resume, or end a race this machine started (resume and cancel ask first)
+  serve [--region R] [--endpoint NAME] | serve ec2 | serve list [--json] | serve stop (--port P | --endpoint N)
+                              run a tunnel in the background, list the ones running, or stop one
+  capacity search|held|chain|buy
+                              EC2 capacity blocks: search, held, chain --hours N read only; buy <id> --region R
+                              --yes pays the block's fee
+  doctor [--json] [--fix R3,R5 --yes]
+                              what drip-ai left in AWS and on this machine; --fix runs only those fixes
+  learn show|explain|forget|export|import
+                              the local learning store (DRIP_AI_LEARN=off turns it off)
+  runtime probe --help-file FILE | --docker
+                              record which vLLM flags an image accepts
+  logs <endpoint> [--region R] [--follow]
+                              the endpoint's CloudWatch log
   fetch [args] [--yes]        copy a Hugging Face model into S3 (shared/fetch-model/fetch-model.sh)
   models upload <folder>|list
   key                         print the API key into a pipe: export DRIP_AI_API_KEY="$(bin/drip-ai key)"
@@ -61,8 +85,9 @@ Usage: bin/drip-ai <group> <command> [args]
 --yes answers only that run's own question (Terraform's apply or destroy, start's race, fetch's
 launch) after the plan and costs print. It never types an endpoint name for --take-over or
 --force, and never the Hugging Face token: fetch --yes refuses a gated repo.
-Region: DRIP_AI_REGION, else AWS_REGION, else AWS_DEFAULT_REGION, else us-east-1.
-Links: DRIP_AI_LINK_CLIENTS=codex,claude (or all, or none) picks what a tunnel links; DRIP_AI_PORT moves 8000.
+Region: DRIP_AI_REGION, else AWS_REGION, else AWS_DEFAULT_REGION, else us-east-1; races also use the
+config's regions. Links: clients.link in your config, or DRIP_AI_LINK_CLIENTS=codex,claude (or all, or
+none), picks what a tunnel links; the default is opencode only. DRIP_AI_PORT moves ports.base (8000).
 EOF_USAGE
 }
 
@@ -118,6 +143,8 @@ setup() {
   init_roots
   echo "== apply shared (the models bucket, the API key, and the resource group)"
   tf_approved "$yes" shared apply || { echo "drip-ai: the shared apply failed or was declined" >&2; exit 1; }
+  echo "== apply sagemaker (the foundation every race in $region needs: the execution role)"
+  tf_approved "$yes" sagemaker apply || { echo "drip-ai: the sagemaker foundation apply failed or was declined" >&2; exit 1; }
   echo "Ready. Next: bin/drip-ai fetch <Org/Name>"
 }
 
@@ -125,7 +152,7 @@ setup() {
 # --smoke` in the foreground. A failed or declined start stops here. The tunnel unlinks the clients
 # on Ctrl-C; this shell only waits for it, then says what still bills.
 up() {
-  local argument model="" yes=() status=0
+  local argument model="" yes=() status=0 winner where
   for argument in "$@"; do
     case "$argument" in
       --yes) yes=(--yes) ;;
@@ -134,10 +161,15 @@ up() {
     esac
   done
   bash "$repo_root/sagemaker/start.sh" ${model:+"$model"} ${yes[@]+"${yes[@]}"} --no-watch || exit $?
+  # The race may win in another region; the tunnel follows the endpoint it kept.
+  where=()
+  if winner="$(python3 -I "$repo_root/sagemaker/race.py" status --last-winner 2>/dev/null)"; then
+    where=(--region "${winner%%$'\t'*}" --endpoint "${winner#*$'\t'}")
+  fi
   # A trapped INT waits for the tunnel to unlink and exit; an ignored one would be inherited, and the
   # tunnel could not trap it.
   trap ':' INT
-  bash "$repo_root/sagemaker/endpoint.sh" tunnel --smoke || status=$?
+  bash "$repo_root/sagemaker/endpoint.sh" tunnel --smoke ${where[@]+"${where[@]}"} || status=$?
   echo "The endpoint still bills until bin/drip-ai sagemaker stop"
   exit "$status"
 }
@@ -177,7 +209,7 @@ ec2_command() {
   local command="${1:-}"
   shift || true
   case "$command" in
-    apply | destroy | start | stop | status | logs | tunnel) run_script ec2/server.sh "$command" "$@" ;;
+    apply | destroy | start | stop | status | logs | tunnel | reconfigure) run_script ec2/server.sh "$command" "$@" ;;
     *) usage_fail "unknown ec2 command '$command'" ;;
   esac
 }
@@ -189,6 +221,59 @@ models_command() {
     upload | list) run_script shared/models.sh "$command" "$@" ;;
     *) usage_fail "unknown models command '$command'" ;;
   esac
+}
+
+# The Python control core: shared/drip_ai/cli.py, with the home region where a command needs one.
+core() {
+  exec python3 -I "$repo_root/shared/drip_ai/cli.py" "$@"
+}
+
+home_region() {
+  drip_region || exit 1
+}
+
+serve_command() {
+  case "${1:-}" in
+    list | stop) exec python3 -I "$repo_root/shared/drip_ai/serve.py" "$@" ;;
+    ec2)
+      shift
+      [ $# -eq 0 ] || usage_fail "serve ec2 takes no arguments"
+      exec python3 -I "$repo_root/shared/drip_ai/serve.py" detach --log "tunnel-ec2-$(date +%s)" -- \
+        bash "$repo_root/ec2/server.sh" tunnel
+      ;;
+    *) run_script sagemaker/endpoint.sh tunnel --detach "$@" ;;
+  esac
+}
+
+race_command() {
+  case "${1:-}" in
+    status | resume | cancel) exec python3 -I "$repo_root/sagemaker/race.py" "$@" ;;
+    *) usage_fail "race takes status, resume, or cancel" ;;
+  esac
+}
+
+capacity_command() {
+  case "${1:-}" in
+    search | held | chain) exec python3 -I "$repo_root/ec2/capacity.py" "$@" --home-region "$(home_region)" ;;
+    buy) exec python3 -I "$repo_root/ec2/capacity.py" "$@" ;;
+    *) usage_fail "capacity takes search, held, chain, or buy" ;;
+  esac
+}
+
+logs_command() {
+  local endpoint="${1:-}" region="" follow=()
+  [ -n "$endpoint" ] || usage_fail "logs needs an endpoint name"
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --region) [ $# -ge 2 ] || usage_fail "--region needs a value"; region="$2"; shift ;;
+      --follow) follow=(--follow) ;;
+      *) usage_fail "logs takes an endpoint, --region, and --follow" ;;
+    esac
+    shift
+  done
+  [ -n "$region" ] || region="$(home_region)"
+  core logs "$endpoint" --region "$region" ${follow[@]+"${follow[@]}"}
 }
 
 codex_command() {
@@ -212,6 +297,13 @@ case "$group" in
   up) up "$@" ;;
   status) status_command "$@" ;;
   key | smoke | link | unlink) run_script shared/clients.sh "$group" "$@" ;;
+  plan) [ $# -ge 1 ] || usage_fail "plan needs a model name"; core plan "$@" --home-region "$(home_region)" ;;
+  config | learn | runtime) core "$group" "$@" ;;
+  doctor) core doctor --home-region "$(home_region)" "$@" ;;
+  serve) serve_command "$@" ;;
+  race) race_command "$@" ;;
+  capacity) capacity_command "$@" ;;
+  logs) logs_command "$@" ;;
   codex) codex_command "$@" ;;
   tf)
     [ $# -ge 2 ] || usage_fail "tf needs a stack and Terraform arguments"

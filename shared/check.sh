@@ -2,15 +2,49 @@
 # The repo gate: Terraform format, init without a backend, validate, and test on every root; bash -n
 # on every shell script; every Python unittest suite. Stops at the first failing step and names it.
 # Needs no AWS credentials and touches no state. `--dry-run` prints the steps without running them.
+# `--public` first checks the tree is fit to publish: profiles.json is {}, and no catalog or default
+# file names a model_type or a Hugging Face repo id.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-dry_run=no
-case "$#:${1:-}" in
-  0:) ;;
-  1:--dry-run) dry_run=yes ;;
-  *) echo "Usage: shared/check.sh [--dry-run]" >&2; exit 2 ;;
-esac
+dry_run=no public=no
+for argument in "$@"; do
+  case "$argument" in
+    --dry-run) dry_run=yes ;;
+    --public) public=yes ;;
+    *) echo "Usage: shared/check.sh [--dry-run] [--public]" >&2; exit 2 ;;
+  esac
+done
+
+# Exits 1, naming the file and key, when the tree carries a model choice the public release keeps out.
+public_tree() {
+  python3 -I - "$repo_root" <<'PY'
+import json, re, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+REPO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*(@[0-9a-f]{7,40})?")
+problems = []
+if json.loads((root / "shared/model-profiles/profiles.json").read_text()) != {}:
+    problems.append("shared/model-profiles/profiles.json is not {}")
+
+def walk(node, path, name):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "model_type" or REPO_ID.fullmatch(key):
+                problems.append(f"{name} has key {'.'.join(path + [key])}")
+            walk(value, path + [key], name)
+    elif isinstance(node, list):
+        for item in node:
+            walk(item, path, name)
+
+for path in sorted([*root.glob("shared/catalog/*.json"), root / "shared/config/defaults.json"]):
+    walk(json.loads(path.read_text()), [], str(path.relative_to(root)))
+for problem in problems:
+    print(f"check --public: {problem}", file=sys.stderr)
+sys.exit(1 if problems else 0)
+PY
+}
 
 # Terraform roots in gate order.
 terraform_roots="bootstrap shared/terraform shared/fetch-model/terraform sagemaker/terraform ec2/terraform"
@@ -31,6 +65,7 @@ step() {
 }
 
 cd "$repo_root"
+[ "$public" = no ] || step "public tree" public_tree
 # Each root gets a throwaway data dir, so a checkout initialised against the real S3 backend never
 # makes the gate read that backend (or need credentials). Providers come from a shared plugin cache.
 gate_data=""

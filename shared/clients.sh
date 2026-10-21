@@ -10,9 +10,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=lib/common.sh
 source "$repo_root/shared/lib/common.sh"
 
-local_port="${DRIP_AI_PORT:-8000}"
-# The name shared/modules/conventions gives the key parameter.
-api_key_parameter=/drip-ai/api-key
+api_key_parameter="$api_key_parameter_name"
 
 usage() {
   cat <<'EOF_USAGE'
@@ -33,10 +31,32 @@ EOF_USAGE
 
 fail() { echo "$1" >&2; exit 1; }
 
+# The local port: DRIP_AI_PORT, else ports.base from the drip-ai config (default 8000).
+smoke_port() {
+  local port="${DRIP_AI_PORT:-}"
+  [ -n "$port" ] || port="$(drip_config ports.base)" || return 1
+  [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || { echo "drip-ai: the local port '$port' is not a TCP port" >&2; return 1; }
+  echo "$port"
+}
+
+# The region whose key opens the tunnel on PORT: DRIP_AI_REGION when set, else the region of the
+# registered drip-ai tunnel on that port, else the home region. Each region's shared stack holds
+# its own key.
+key_region() {
+  local region
+  if [ -z "${DRIP_AI_REGION:-}" ] && [ -n "${1:-}" ] &&
+    region="$(python3 -I "$repo_root/shared/drip_ai/serve.py" region --port "$1" 2>/dev/null)" &&
+    [[ "$region" =~ $region_pattern ]]; then
+    echo "$region"
+    return 0
+  fi
+  drip_region
+}
+
 # Prints the key. Refused characters would break the curl config line the key travels in.
 api_key() {
   local region key
-  region="$(drip_region)" || return 1
+  region="$(key_region "${local_port:-}")" || return 1
   key="$(aws ssm get-parameter --region "$region" --name "$api_key_parameter" --with-decryption \
     --query Parameter.Value --output text)" || {
     echo "drip-ai: could not read $api_key_parameter from SSM in $region; check your AWS credentials and region" >&2
@@ -269,6 +289,9 @@ codex_command() {
 
 command="${1:-}"
 shift || true
+case "$command" in
+  key | smoke | link) local_port="$(smoke_port)" || exit 1 ;;
+esac
 case "$command" in
   key) [ $# -eq 0 ] || { usage >&2; exit 2; }; key_command ;;
   smoke) [ $# -eq 0 ] || { usage >&2; exit 2; }; smoke ;;

@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "about": "Facts per container image digest: its vLLM version (null when unknown) with the version's class, and per-flag support. A flag status is supported or rejected; a flag not listed falls back to vllm_flags.json since against a known version, else it is unknown. features name engine paths a flag alone does not prove; a feature@smNN entry holds only on that GPU architecture, and is checked before the plain name. Learned observations and bin/drip-ai runtime probe add evidence.",
+  "runtimes": {
+    "sha256:64fa565e864edb53c376b754bd3813935a78298edc1b9ed940d052bda7c63c4f": {
+      "name": "AWS vLLM SageMaker image server-sagemaker-cuda-v2.6.1",
+      "vllm_version": null,
+      "vllm_version_class": "unknown",
+      "vllm_version_note": "its startup log reports vLLM 0.30.0+amzn2023 (2026-10-09); left null so a flag's since release alone never adds an untried flag to a scarce SageMaker launch",
+      "flags": {
+        "--decode-context-parallel-size": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "an 8xH200 endpoint with DCP 8 reached InService and passed a chat smoke, 2026-10-09"
+        },
+        "--kv-cache-dtype": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "the same endpoint ran with kv-cache-dtype fp8"
+        },
+        "--speculative-config": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "the same endpoint ran with MTP, 1 speculative token"
+        },
+        "--enable-prefix-caching": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "the same endpoint ran with prefix caching"
+        },
+        "--max-num-batched-tokens": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "the same endpoint ran with 8192 batched tokens"
+        },
+        "--async-scheduling": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "an 8xH200 endpoint ran with async scheduling, TP 8, DCP 8, MTP 1, and fp8 KV, 2026-10-09"
+        },
+        "--dcp-comm-backend": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "SM_VLLM_DCP_COMM_BACKEND=ag_rs served with DCP 8 on 8xH200, 2026-10-09; without it the image picks a2a, which FlashMLA sparse rejects at startup"
+        },
+        "--override-generation-config": {
+          "status": "supported",
+          "class": "derived",
+          "evidence": "the image's startup log reports vLLM 0.30.0+amzn2023, and the flag is in every vLLM release since 0.8"
+        },
+        "--enable-auto-tool-choice": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "model profiles served parsed tool calls on this image"
+        },
+        "--tool-call-parser": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "model profiles served parsed tool calls on this image"
+        },
+        "--reasoning-parser": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "model profiles served on this image"
+        },
+        "--gpu-memory-utilization": {
+          "status": "supported",
+          "class": "derived",
+          "evidence": "an engine flag in every vLLM release since 0.2"
+        }
+      },
+      "features": {
+        "kv_layout:fp8_ds_mla@sm90": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "fp8 KV on an mla_dsa model with DCP 8 served, 2026-10-09"
+        },
+        "dcp:mla_dsa@sm90": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "DCP 8 with --dcp-comm-backend ag_rs on an mla_dsa model served on 8xH200, 2026-10-09, with TP 8, MTP 1, fp8_ds_mla KV, prefix caching, async scheduling, and 8192 batched tokens"
+        },
+        "mtp": {
+          "status": "supported",
+          "class": "measured",
+          "evidence": "MTP 1 on an mla_dsa model served, 2026-10-09"
+        }
+      }
+    },
+    "sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90": {
+      "name": "vllm/vllm-openai:v0.30.0",
+      "vllm_version": "0.30.0",
+      "vllm_version_class": "reported",
+      "flags": {},
+      "features": {}
+    }
+  }
+}

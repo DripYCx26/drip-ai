@@ -61,6 +61,27 @@ class KeyTest(unittest.TestCase):
             self.assertEqual(result.stdout, KEY + "\n")
             self.assertEqual([(c.tool, c.argv) for c in repo.calls()], [("aws", GET_KEY)])
 
+    def test_key_and_smoke_follow_the_registered_tunnel_on_the_port(self):
+        with make_repo() as repo:
+            sys.path.append(str(Path(__file__).resolve().parents[1]))
+            from drip_ai import procs
+
+            proc = subprocess.Popen(["sleep", "60"])
+            self.addCleanup(proc.wait)
+            self.addCleanup(proc.kill)
+            procs.register({"HOME": str(repo.home)}, proc.pid, ["tunnel"], port=8002, endpoint="drip-ai-h200-us-east-2-1",
+                           region="us-east-2", provider="drip-ai-us-east-2")
+            result = repo.run(SCRIPT, "key", env={"DRIP_AI_PORT": "8002"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            [call] = repo.calls()
+            self.assertEqual(call.argv[call.argv.index("--region") + 1], "us-east-2")
+            config = repo.home / ".config" / "drip-ai" / "config.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"ports": {"base": 8002}}))
+            config.chmod(0o600)
+            self.assertEqual(repo.run(SCRIPT, "key").returncode, 0)
+            self.assertEqual(repo.calls()[-1].argv[repo.calls()[-1].argv.index("--region") + 1], "us-east-2")
+
     def test_key_refuses_on_terminal(self):
         with make_repo() as repo:
             primary, secondary = pty.openpty()
@@ -295,7 +316,7 @@ class LinkCommandsTest(unittest.TestCase):
             self.assertEqual(repo.run(SCRIPT, "unlink", "claude", "--force", env=ENV).returncode, 0)
             unlinks = [c.argv for c in repo.calls() if c.argv[0] == "unlink"]
             self.assertEqual(unlinks, [["unlink", "--provider", "drip-ai"], ["unlink", "--client", "claude"],
-                                       ["unlink", "--client", "opencode"],
+                                       ["unlink", "--client", "opencode", "--provider", "drip-ai"],
                                        ["unlink", "--client", "claude", "--force"]])
 
 

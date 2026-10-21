@@ -103,7 +103,7 @@ resource "aws_ssm_parameter" "hf_token" {
 }
 
 resource "aws_iam_role" "fetch_model_task" {
-  name = "${var.project}-fetch-model-task"
+  name = "${var.project}-fetch-model-task${module.conventions.global_name_suffix}"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -143,7 +143,7 @@ resource "aws_iam_role_policy" "fetch_model_task" {
 }
 
 resource "aws_iam_role" "fetch_model_execution" {
-  name = "${var.project}-fetch-model-execution"
+  name = "${var.project}-fetch-model-execution${module.conventions.global_name_suffix}"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
