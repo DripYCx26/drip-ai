@@ -5,18 +5,22 @@
 # Pinning every variable keeps these runs independent of that file; update this
 # block when a default changes.
 variables {
-  project              = "drip-ai"
-  region               = "us-east-1"
-  instance_type        = "g6e.2xlarge"
-  root_volume_gb       = 300
-  model_source         = "Org/Model"
-  model_from_s3        = false
-  served_model_name    = "drip-coder"
-  tensor_parallel_size = 1
-  max_model_len        = 65536
-  max_num_seqs         = null
-  vllm_extra_args      = ["--enable-auto-tool-choice", "--tool-call-parser", "example_tool"]
-  hf_token_parameter   = ""
+  project                 = "drip-ai"
+  region                  = "us-east-1"
+  instance_type           = "g6e.2xlarge"
+  root_volume_gb          = 300
+  model_source            = "Org/Model"
+  model_from_s3           = false
+  served_model_name       = "drip-coder"
+  tensor_parallel_size    = 1
+  max_model_len           = 65536
+  max_num_seqs            = null
+  vllm_extra_args         = ["--enable-auto-tool-choice", "--tool-call-parser", "example_tool"]
+  hf_token_parameter      = ""
+  capacity_reservation_id = ""
+  market_type             = ""
+  availability_zone       = ""
+  zone_subnets            = {}
 }
 
 # The provider checks ARN shape even when mocked, so ARNs that feed other
@@ -149,7 +153,7 @@ run "max_num_seqs_is_optional_and_reaches_vllm" {
   }
 
   assert {
-    condition     = strcontains(aws_instance.server.user_data, "--max-num-seqs 48")
+    condition     = strcontains(aws_instance.server.user_data, "\"--max-num-seqs\",\"48\"")
     error_message = "max_num_seqs must be passed to the vLLM launch when configured."
   }
 }
@@ -172,6 +176,84 @@ run "prefix_caching_cannot_be_disabled_with_a_value" {
   }
 
   expect_failures = [var.vllm_extra_args]
+}
+
+# Flags change in place through /etc/drip-ai/vllm.args; a new boot script never replaces the server.
+run "user_data_writes_the_vllm_argv_once_and_changes_never_replace_the_instance" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      strcontains(aws_instance.server.user_data, jsonencode(["Org/Model", "--served-model-name", "drip-coder", "--tensor-parallel-size", "1", "--max-model-len", "65536", "--enable-auto-tool-choice", "--tool-call-parser", "example_tool"])),
+      strcontains(aws_instance.server.user_data, "cat > /etc/drip-ai/vllm.args <<'EOF_ARGS'"),
+      strcontains(aws_instance.server.user_data, "\"$${args[@]}\""),
+      strcontains(aws_instance.server.user_data, "/usr/local/bin/drip-ai-vllm\n"),
+    ])
+    error_message = "User data must write the full vLLM argv as JSON and start the container through the launcher."
+  }
+
+  assert {
+    condition     = aws_instance.server.user_data_replace_on_change == false
+    error_message = "A changed boot script must not replace the instance; ec2 reconfigure changes flags in place."
+  }
+
+  assert {
+    condition     = output.model_arg == "Org/Model" && output.tensor_parallel_size == 1
+    error_message = "reconfigure rebuilds the argv from the model_arg and tensor_parallel_size outputs."
+  }
+}
+
+run "a_capacity_block_launch_targets_its_reservation_and_zone" {
+  command = plan
+
+  variables {
+    capacity_reservation_id = "cr-0123456789abcdef0"
+    market_type             = "capacity-block"
+    availability_zone       = "us-east-1-atl-2a"
+    zone_subnets            = { "us-east-1-atl-2a" = "subnet-0123456789abcdef0" }
+  }
+
+  assert {
+    condition = (
+      aws_instance.server.instance_market_options[0].market_type == "capacity-block" &&
+      aws_instance.server.capacity_reservation_specification[0].capacity_reservation_target[0].capacity_reservation_id == "cr-0123456789abcdef0" &&
+      aws_instance.server.subnet_id == "subnet-0123456789abcdef0"
+    )
+    error_message = "A capacity-block launch must name its market type, its reservation, and the zone's subnet."
+  }
+}
+
+run "a_capacity_block_market_needs_its_reservation" {
+  command = plan
+
+  variables {
+    market_type = "capacity-block"
+  }
+
+  expect_failures = [aws_instance.server]
+}
+
+run "a_zone_needs_its_subnet" {
+  command = plan
+
+  variables {
+    availability_zone = "us-east-1-atl-2a"
+  }
+
+  expect_failures = [aws_instance.server]
+}
+
+run "a_second_region_suffixes_the_global_iam_names" {
+  command = plan
+
+  variables {
+    region = "us-east-2"
+  }
+
+  assert {
+    condition     = aws_iam_role.server.name == "drip-ai-model-server-us-east-2" && aws_iam_instance_profile.server.name == "drip-ai-model-server-us-east-2"
+    error_message = "IAM names are account-global, so the role and instance profile outside us-east-1 must end in -<region>."
+  }
 }
 
 run "hf_token_parameter_cannot_alias_managed" {

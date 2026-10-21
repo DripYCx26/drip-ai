@@ -53,7 +53,7 @@ def unlinks(repo):
     return [" ".join(c.argv) for c in repo.calls() if c.tool in ("codex_link", "json_link") and c.argv[0] == "unlink"]
 
 
-ALL_UNLINKS = ["unlink --provider drip-ai", "unlink --client claude", "unlink --client opencode"]
+ALL_UNLINKS = ["unlink --provider drip-ai", "unlink --client claude", "unlink --client opencode --provider drip-ai"]
 
 
 def calls_of_json_link(repo):
@@ -182,13 +182,13 @@ class ServerTest(unittest.TestCase):
             repo.stub("json_link", "link", stdout="linked to drip-coder\n")
             repo.stub("terraform", "output", "-raw", "served_model_name", stdout="drip-coder")
             repo.stub("terraform", "output", "-raw", "max_model_len", stdout="32768")
-            repo.stub("terraform", "output", "-raw", "api_key_parameter", stdout="/drip-ai/api-key")
             repo.stub("aws", "ssm", "get-parameter", stdout=KEY + "\n")
             repo.stub("curl", stdout="200")
             repo.stub("aws", "describe-instances", stdout="pending\n", times=1)
             repo.stub("aws", "describe-instances", stdout="running\n")
             port = str(free_port())
             env = {**ENV, "DRIP_AI_PORT": port, "DRIP_AI_TUNNEL_POLL_SECONDS": "1", "SESSION_LOG": str(session_log),
+                   "DRIP_AI_LINK_CLIENTS": "all",
                    "PATH": f"{wrapper_dir}{os.pathsep}{repo.bin_dir}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}"}
             out_path, err_path = repo.home / "out", repo.home / "err"
             with open(out_path, "w") as out, open(err_path, "w") as err:
@@ -217,6 +217,42 @@ class ServerTest(unittest.TestCase):
             link = calls_of_json_link(repo)[0]
             self.assertEqual(link[link.index("--context-window") + 1], "32768")
             self.assertNotIn(KEY, out_path.read_text() + err_path.read_text())
+            # The tunnel registered itself while it ran and removed its record on exit.
+            registry = repo.home / ".local" / "state" / "drip-ai" / "procs"
+            self.assertEqual(list(registry.glob("*.json")), [])
+
+    def test_ec2_reconfigure_rewrites_the_argv_and_restarts_vllm_in_place(self):
+        import base64
+
+        with make_repo() as repo:
+            repo.stub("terraform", "output", "-raw", "model_arg", stdout="/models/Org/Model")
+            repo.stub("terraform", "output", "-raw", "served_model_name", stdout="drip-coder")
+            repo.stub("terraform", "output", "-raw", "tensor_parallel_size", stdout="4")
+            repo.stub("terraform", "output", "-raw", "max_model_len", stdout="32768")
+            repo.stub("aws", "send-command", stdout="cmd-1\n")
+            repo.stub("aws", "wait", "command-executed")
+            repo.stub("aws", "get-command-invocation", stdout="Success\t\t\n")
+            result = repo.run(SCRIPT, "reconfigure", "--", "--enable-auto-tool-choice", "--tool-call-parser",
+                              "example_tool", env=ENV)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            [send] = [c.argv for c in repo.calls() if "send-command" in c.argv]
+            commands = json.loads(send[send.index("--parameters") + 1])["commands"]
+            payload = commands[0].split(" ")[2]
+            self.assertEqual(json.loads(base64.b64decode(payload)), [
+                "/models/Org/Model", "--served-model-name", "drip-coder", "--tensor-parallel-size", "4",
+                "--max-model-len", "32768", "--enable-auto-tool-choice", "--tool-call-parser", "example_tool"])
+            self.assertEqual(commands[-1], "/usr/local/bin/drip-ai-vllm")
+            self.assertEqual([c for c in repo.calls() if c.tool == "terraform" and "apply" in c.argv], [])
+        with make_repo() as repo:
+            for name, value in (("model_arg", "m"), ("served_model_name", "d"), ("tensor_parallel_size", "1"),
+                                ("max_model_len", "8")):
+                repo.stub("terraform", "output", "-raw", name, stdout=value)
+            for bad in (["--max-model-len", "9"], ["--api-key", "x"], ["--flag=x"]):
+                with self.subTest(bad):
+                    result = repo.run(SCRIPT, "reconfigure", "--", *bad, env=ENV)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("nothing was sent to the instance", result.stderr)
+            self.assertEqual([c for c in repo.calls() if "send-command" in c.argv], [])
 
 
 if __name__ == "__main__":

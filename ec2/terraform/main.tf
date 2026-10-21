@@ -1,6 +1,10 @@
 # One GPU EC2 instance running the pinned vLLM container on 127.0.0.1:8000.
 # Clients reach it only through an SSM port-forward. Turning it off is
-# `destroy` on this root.
+# `destroy` on this root. It can launch into a capacity block
+# (capacity_reservation_id with market_type = "capacity-block") in a zone of
+# zone_subnets. The boot script writes the vLLM argv to /etc/drip-ai/vllm.args,
+# which `bin/drip-ai ec2 reconfigure` rewrites in place, so a flag change never
+# replaces the instance.
 
 module "conventions" {
   source = "../../shared/modules/conventions"
@@ -28,10 +32,19 @@ locals {
     "arn:${module.conventions.partition}:ssm:${var.region}:${module.conventions.account_id}:parameter${var.hf_token_parameter}",
   ]
   readable_parameter_arns = concat([module.conventions.api_key_parameter_arn], local.hf_token_parameter_arns)
+
+  # The container's argv after the image: the model, the flags Terraform owns, then the operator's.
+  model_arg = var.model_from_s3 ? "/models/${var.model_source}" : var.model_source
+  vllm_args = concat([
+    local.model_arg,
+    "--served-model-name", var.served_model_name,
+    "--tensor-parallel-size", tostring(var.tensor_parallel_size),
+    "--max-model-len", tostring(var.max_model_len),
+  ], var.max_num_seqs == null ? [] : ["--max-num-seqs", tostring(var.max_num_seqs)], var.vllm_extra_args)
 }
 
 resource "aws_iam_role" "server" {
-  name = "${var.project}-model-server"
+  name = "${var.project}-model-server${module.conventions.global_name_suffix}"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -81,7 +94,7 @@ resource "aws_iam_role_policy" "server" {
 }
 
 resource "aws_iam_instance_profile" "server" {
-  name = "${var.project}-model-server"
+  name = "${var.project}-model-server${module.conventions.global_name_suffix}"
   role = aws_iam_role.server.name
 }
 
@@ -105,6 +118,23 @@ resource "aws_instance" "server" {
   iam_instance_profile        = aws_iam_instance_profile.server.name
   vpc_security_group_ids      = [aws_security_group.server.id]
   associate_public_ip_address = true
+  subnet_id                   = var.availability_zone == "" ? null : var.zone_subnets[var.availability_zone]
+
+  dynamic "instance_market_options" {
+    for_each = var.market_type == "capacity-block" ? [1] : []
+    content {
+      market_type = "capacity-block"
+    }
+  }
+
+  dynamic "capacity_reservation_specification" {
+    for_each = var.capacity_reservation_id == "" ? [] : [1]
+    content {
+      capacity_reservation_target {
+        capacity_reservation_id = var.capacity_reservation_id
+      }
+    }
+  }
 
   metadata_options {
     http_tokens = "required"
@@ -119,25 +149,32 @@ resource "aws_instance" "server" {
     encrypted   = true
   }
 
-  user_data_replace_on_change = true
+  # The boot script runs once; later flag changes go through bin/drip-ai ec2 reconfigure.
+  user_data_replace_on_change = false
   user_data = templatefile("${path.module}/user-data.sh.tftpl", {
-    region               = var.region
-    bucket               = data.aws_s3_bucket.models.id
-    api_key_parameter    = module.conventions.api_key_parameter
-    hf_token_parameter   = var.hf_token_parameter
-    vllm_image           = module.conventions.vllm_image
-    model_source         = var.model_source
-    model_from_s3        = var.model_from_s3
-    served_model_name    = var.served_model_name
-    tensor_parallel_size = var.tensor_parallel_size
-    max_model_len        = var.max_model_len
-    max_num_seqs         = var.max_num_seqs
-    vllm_extra_args      = join(" ", var.vllm_extra_args)
+    region             = var.region
+    bucket             = data.aws_s3_bucket.models.id
+    api_key_parameter  = module.conventions.api_key_parameter
+    hf_token_parameter = var.hf_token_parameter
+    vllm_image         = module.conventions.vllm_image
+    model_source       = var.model_source
+    model_from_s3      = var.model_from_s3
+    vllm_args_json     = jsonencode(local.vllm_args)
   })
 
-  # A new AMI release must not silently replace a running server.
+  # A new AMI release or a changed boot script must not silently replace a running server.
   lifecycle {
-    ignore_changes = [ami]
+    ignore_changes = [ami, user_data]
+
+    precondition {
+      condition     = var.market_type != "capacity-block" || var.capacity_reservation_id != ""
+      error_message = "market_type = \"capacity-block\" needs the capacity_reservation_id of the block (bin/drip-ai capacity held lists them)."
+    }
+
+    precondition {
+      condition     = var.availability_zone == "" || contains(keys(var.zone_subnets), var.availability_zone)
+      error_message = "availability_zone must be a key of zone_subnets, naming a default-VPC subnet in that zone."
+    }
   }
 
   tags = {

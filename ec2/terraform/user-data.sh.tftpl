@@ -1,10 +1,12 @@
 #!/bin/bash
 # First-boot setup for the model server. Rendered by Terraform; runs once as root via cloud-init.
 # The container restarts on its own after a stop/start, so this script does not need to rerun.
+# The vLLM argv lives in /etc/drip-ai/vllm.args (a JSON list); /usr/local/bin/drip-ai-vllm starts
+# the container from it, and bin/drip-ai ec2 reconfigure rewrites it and runs the launcher again.
 set -euo pipefail
 exec > >(tee -a /var/log/drip-ai-bootstrap.log) 2>&1
 
-for tool in docker nvidia-ctk aws nvidia-smi; do
+for tool in docker nvidia-ctk aws nvidia-smi python3; do
   command -v "$tool" >/dev/null || { echo "bootstrap: $tool missing from the AMI"; exit 1; }
 done
 nvidia-smi --query-gpu=name,memory.total --format=csv
@@ -34,26 +36,30 @@ install -d /opt/models /opt/hf-cache
 %{ if model_from_s3 ~}
 aws s3 sync --region ${region} --only-show-errors 's3://${bucket}/models/${model_source}/' '/opt/models/${model_source}/'
 [ -f '/opt/models/${model_source}/config.json' ] || { echo "bootstrap: no config.json in s3://${bucket}/models/${model_source}/"; exit 1; }
-model_arg='/models/${model_source}'
-%{ else ~}
-model_arg='${model_source}'
 %{ endif ~}
 
-docker pull '${vllm_image}'
+cat > /etc/drip-ai/vllm.args <<'EOF_ARGS'
+${vllm_args_json}
+EOF_ARGS
+
+cat > /usr/local/bin/drip-ai-vllm <<'EOF_LAUNCHER'
+#!/bin/bash
+# Starts the vLLM container with the argv in /etc/drip-ai/vllm.args, replacing a running one.
+set -euo pipefail
+args=()
+while IFS= read -r arg; do args+=("$arg"); done < <(python3 -c 'import json; print("\n".join(json.load(open("/etc/drip-ai/vllm.args"))))')
+docker rm -f vllm >/dev/null 2>&1 || true
 docker run -d --name vllm --restart unless-stopped \
   --gpus all --ipc=host \
   -p 127.0.0.1:8000:8000 \
-  --env-file "$env_file" \
+  --env-file /etc/drip-ai/vllm.env \
   -v /opt/models:/models:ro \
   -v /opt/hf-cache:/root/.cache/huggingface \
-  '${vllm_image}' \
-  "$model_arg" \
-  --served-model-name '${served_model_name}' \
-  --tensor-parallel-size ${tensor_parallel_size} \
-  --max-model-len ${max_model_len} \
-%{ if max_num_seqs != null ~}
-  --max-num-seqs ${max_num_seqs} \
-%{ endif ~}
-  ${vllm_extra_args}
+  '${vllm_image}' "$${args[@]}"
+EOF_LAUNCHER
+chmod 700 /usr/local/bin/drip-ai-vllm
+
+docker pull '${vllm_image}'
+/usr/local/bin/drip-ai-vllm
 
 echo "bootstrap: vllm container started; first load downloads weights and can take several minutes"

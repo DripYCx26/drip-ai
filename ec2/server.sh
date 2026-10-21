@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The EC2 GPU server: apply or destroy its Terraform root, start or stop the instance, show its
-# state and logs, and open the SSM tunnel that links Codex, Claude Code, and opencode. Design:
-# docs/DECISIONS.md, 2026-10-05 "Folders per backend, Terraform roots per stack". Bash 3.2 compatible.
-# apply and destroy show the plan and wait for the user's yes; --yes answers it, after the plan.
+# state and logs, rewrite its vLLM flags in place, and open the SSM tunnel that links the clients.
+# Design: docs/DECISIONS.md, 2026-10-05 "Folders per backend, Terraform roots per stack", and
+# 2026-10-09 "Plan, race, and learn in a Python control core". Bash 3.2 compatible. apply and
+# destroy show the plan and wait for the user's yes; --yes answers it, after the plan.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -25,9 +26,12 @@ Usage: ec2/server.sh <command>
   stop      unlink the clients, then stop the instance (its EBS volume still bills)
   status    show the instance id, type, and state
   logs      last 100 lines of the bootstrap and vLLM logs
+  reconfigure [-- FLAG...]
+            rewrite the vLLM flags after the ones Terraform owns in /etc/drip-ai/vllm.args on the
+            instance, then restart vLLM there; no flag clears them all
   tunnel [--no-link]
-            serve localhost:$DRIP_AI_PORT (default 8000) through an SSM port-forward and link Codex,
-            Claude Code, and opencode until it closes
+            serve localhost:<port> (ports.base, default 8000) through an SSM port-forward and link
+            the clients in clients.link until it closes
 
 apply, destroy, and start take --yes: it answers Terraform's question after the plan prints. start
 asks nothing, and takes --yes so every command that spends does.
@@ -81,6 +85,29 @@ port_forward() {
     --parameters "portNumber=8000,localPortNumber=$local_port"
 }
 
+# Rewrites the instance's /etc/drip-ai/vllm.args over SSM RunCommand and restarts the container
+# with it. The argv keeps the model and the flags Terraform owns, then FLAGS, which pass the same
+# flag rules as SageMaker's (shared/drip_ai/sizing.py) before anything is sent.
+reconfigure() {
+  local model_arg served tp window payload command_id
+  resolve_instance
+  model_arg="$(tf_output ec2 model_arg)" && served="$(tf_output ec2 served_model_name)" &&
+    tp="$(tf_output ec2 tensor_parallel_size)" && window="$(tf_output ec2 max_model_len)" ||
+    fail "could not read the model and owned flags from the ec2 Terraform root"
+  payload="$(python3 -I "$repo_root/shared/drip_ai/cli.py" vllm-args --model-arg "$model_arg" \
+    --served-model-name "$served" --tensor-parallel-size "$tp" --max-model-len "$window" -- "$@")" ||
+    fail "the flags were refused; nothing was sent to the instance"
+  [[ "$payload" =~ ^[A-Za-z0-9+/=]+$ ]] || fail "the encoded argv has an unexpected form; nothing was sent"
+  echo "Rewriting /etc/drip-ai/vllm.args on $instance and restarting vLLM; it serves again once the model loads."
+  command_id="$(aws ssm send-command --region "$region" --instance-ids "$instance" \
+    --document-name AWS-RunShellScript \
+    --parameters "{\"commands\":[\"printf %s $payload | base64 -d > /etc/drip-ai/vllm.args.new\",\"chmod 600 /etc/drip-ai/vllm.args.new\",\"mv /etc/drip-ai/vllm.args.new /etc/drip-ai/vllm.args\",\"/usr/local/bin/drip-ai-vllm\"]}" \
+    --query Command.CommandId --output text)" || fail "SSM did not take the command; nothing changed"
+  aws ssm wait command-executed --region "$region" --command-id "$command_id" --instance-id "$instance" || true
+  aws ssm get-command-invocation --region "$region" --command-id "$command_id" --instance-id "$instance" \
+    --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
+}
+
 remote_logs() {
   local command_id
   command_id="$(aws ssm send-command --region "$region" --instance-ids "$instance" \
@@ -95,6 +122,14 @@ remote_logs() {
 
 command="${1:-}"
 assume_yes=no
+if [ "$command" = reconfigure ]; then
+  shift
+  [ "${1:-}" != -- ] || shift
+  region=""
+  instance=""
+  reconfigure "$@"
+  exit 0
+fi
 case "$#:$command:${2:-}" in
   [01]:* | 2:tunnel:--no-link | 2:tunnel:--no-codex-link) ;;
   2:apply:--yes | 2:destroy:--yes | 2:start:--yes) assume_yes=yes ;;
@@ -126,12 +161,14 @@ case "$command" in
     ;;
   tunnel)
     case "${2:-}" in
-      --no-link) DRIP_AI_LINK_CLIENTS=none ;;
+      --no-link) export DRIP_AI_LINK_CLIENTS=none ;;
       --no-codex-link) DRIP_AI_CODEX_LINK=0 ;;
     esac
     resolve_instance
     served_model="$(tf_output ec2 served_model_name)" || served_model=""
     context_window="$(tf_output ec2 max_model_len)" || context_window=""
+    serve_prepare ec2 "$region" "$instance" || { status=$?; [ "$status" -eq 2 ] && exit 0; exit 1; }
+    local_port="$DRIP_AI_PORT"
     tunnel_with_link "$served_model" "$context_window" instance_running port_forward
     ;;
   help | -h | --help) usage ;;

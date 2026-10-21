@@ -100,3 +100,42 @@ variable "hf_token_parameter" {
     error_message = "hf_token_parameter must not be /${var.project}/hf-token; that name is reserved for the short-lived model-fetch token."
   }
 }
+
+variable "capacity_reservation_id" {
+  description = "A capacity block's reservation id (cr-...) to launch into; empty launches on demand. bin/drip-ai capacity held lists yours."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.capacity_reservation_id == "" || can(regex("^cr-[0-9a-f]{8,32}$", var.capacity_reservation_id))
+    error_message = "capacity_reservation_id must be empty or a cr-... id."
+  }
+}
+
+variable "market_type" {
+  description = "\"capacity-block\" to run in the block capacity_reservation_id names; empty for on-demand."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = contains(["", "capacity-block"], var.market_type)
+    error_message = "market_type must be empty or capacity-block."
+  }
+}
+
+variable "availability_zone" {
+  description = "Zone to launch in, a key of zone_subnets; a capacity block's offering names its zone. Empty lets AWS choose."
+  type        = string
+  default     = ""
+}
+
+variable "zone_subnets" {
+  description = "Subnet per zone in the default VPC, including opted-in Local Zones, for launches that must land in one zone."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = alltrue([for subnet in values(var.zone_subnets) : can(regex("^subnet-[0-9a-f]{8,17}$", subnet))])
+    error_message = "Every zone_subnets value must be a subnet-... id."
+  }
+}
