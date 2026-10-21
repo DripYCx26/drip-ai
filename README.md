@@ -103,7 +103,6 @@ For later runs, `bin/drip-ai up Org/Name` combines start, tunnel, and smoke. On 
 - [Model configuration](docs/models.md): sizing, profiles, and parser flags.
 - [Connect clients](docs/connect-clients.md): credentials, temporary settings, and recovery.
 - [Troubleshooting](docs/troubleshooting.md): failed starts and cleanup.
-- [Lane runner](lane-runner/README.md): remote build lanes beside a model endpoint.
 - [Architecture](docs/architecture.md) and [decisions](docs/DECISIONS.md): implementation details.
 - [Contributing](CONTRIBUTING.md), [security reports](SECURITY.md), and [agent setup](AGENTS.md).
 

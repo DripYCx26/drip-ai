@@ -19,7 +19,7 @@ repo_root="$(cd "$(dirname "$script_path")/.." && pwd)"
 source "$repo_root/shared/lib/common.sh"
 
 # Every root that keeps state in the shared bucket, in the order setup and init visit them.
-state_roots="shared fetch-model sagemaker ec2 lane-runner"
+state_roots="shared fetch-model sagemaker ec2"
 
 usage() {
   cat <<'EOF_USAGE'
@@ -54,7 +54,7 @@ Usage: bin/drip-ai <group> <command> [args]
   status [CLIENT]             whether each client is linked
   status --json               one JSON object of what runs and bills, for an app to poll; reads only
   codex link|unlink|status    Codex's link program with all its flags
-  tf <stack> <terraform args> run Terraform in one stack (bootstrap, shared, fetch-model, sagemaker, ec2, lane-runner)
+  tf <stack> <terraform args> run Terraform in one stack (bootstrap, shared, fetch-model, sagemaker, ec2)
                               with the generated backend; for import, destroy, -replace (asks first)
   help
 

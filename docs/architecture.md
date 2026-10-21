@@ -19,7 +19,6 @@ Each component has one job:
 | Status snapshot | `shared/status.py` | `bin/drip-ai status --json`: what runs and bills, as one JSON object, read-only |
 | SageMaker backend | `sagemaker/` | Races endpoints, runs AWS's vLLM image, and signs calls through a local proxy |
 | EC2 backend | `ec2/` | One GPU instance running the pinned vLLM container, reached through SSM |
-| Lane runner | `lane-runner/` | CPU host for ranked build lanes and a configurable model endpoint |
 
 ## Request path
 
@@ -52,20 +51,6 @@ An integration can use the same surfaces as the CLI workflow:
 - The HTTP API at `http://localhost:8000/v1` while a tunnel runs, with the API key as a Bearer token.
 - The CLI. Infrastructure and copy commands normally show a plan and request confirmation; `--yes` answers that confirmation for an approved run. `ec2 start` resumes immediately without prompting, so its cost must be approved before invocation. `--yes` never types the endpoint name that `--take-over` and `--force` ask for, nor the Hugging Face token, so `fetch --yes` refuses a gated model. `up` and the tunnels hold their process until it is stopped. `status --json`, `status`, `list`, `models list`, `smoke`, and `check` ask nothing.
 - AWS state: the `StartedBy` and `Project` tags on each endpoint, the models in the models bucket with their `drip-ai-fetch.json` manifests, and the API key in SSM.
-
-The lane runner is a separate Terraform root with state key
-`lane-runner.tfstate`. It accepts an existing instance profile and reads one
-ranked queue object from S3 plus an optional model endpoint key from SSM. Its
-profile must already have those narrowly scoped reads and Session Manager
-access; this root does not create IAM or bucket policies. It does not read a
-database or publish a signal envelope. `BUILD_LANE_COUNT` defaults to 30 and
-`BUILD_LANES_ENABLED` defaults to `1`; the image supplied by the source
-repository owns queue claiming and lane
-execution.
-The image recipe and entrypoint live in `lane-runner/`; the entrypoint fetches
-the ranked object into the persistent checkout before invoking the source
-runner. The source runner's local claim JSON still needs a replacement-host
-checkpoint decision.
 
 ### Status snapshot
 

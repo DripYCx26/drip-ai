@@ -13,10 +13,10 @@ case "$#:${1:-}" in
 esac
 
 # Terraform roots in gate order.
-terraform_roots="bootstrap shared/terraform shared/fetch-model/terraform sagemaker/terraform ec2/terraform lane-runner/terraform"
+terraform_roots="bootstrap shared/terraform shared/fetch-model/terraform sagemaker/terraform ec2/terraform"
 format_only_dirs="shared/modules/conventions"
 test_dirs="shared/tests shared/fetch-model/tests sagemaker/tests ec2/tests"
-script_dirs="bin shared sagemaker ec2 lane-runner"
+script_dirs="bin shared sagemaker ec2"
 
 # step NAME COMMAND [ARGS...]
 step() {
