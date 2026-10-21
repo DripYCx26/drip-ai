@@ -2,6 +2,61 @@
 
 Newest first. These entries describe infrastructure and serving contracts; examples do not identify a selected model.
 
+## 2026-10-21: One public repository
+
+- Decided by: the project owner.
+- Choice: develop drip-ai in one public repository. The general work from the separate private development copy (the control core, the multi-region race, capacity blocks, and the 2026-10-09 H200 findings) is merged here, and that copy is retired. A remote lane-runner stack that depended on private source repositories was removed.
+- Boundary: the tree still ships `profiles.json` as `{}` and names no model; `bin/drip-ai check --public` enforces it. Account ids, bucket names, hostnames, keys, and deployment settings stay in your own config and Terraform variable files, which are gitignored.
+- Rejected: keeping a second repository for private settings, because those settings are local files and a second history only drifts from the first.
+- Residual risk: the earlier public history still contains the removed lane-runner files.
+
+## 2026-10-10: Follow-ups to the Python control core
+
+- Decided by: the project owner, from a live SageMaker endpoint; each line below changes the 2026-10-09 entry where they differ.
+- Clients: `clients.link` defaults to `["opencode"]`. Codex and Claude Code are linked only when listed (or with `DRIP_AI_LINK_CLIENTS=all`); `clients.link=[]` links none. A tunnel never redirects Codex or Claude Code implicitly.
+- Container started: only a log stream created at or after the endpoint's `CreationTime` counts, both for "a capacity failure with no log stream is retried" and for reading a failed or winning lane's log (`shared/drip_ai/logsignals.py` filters by creation time and passes `--start-time`). A reused endpoint name keeps the streams of earlier endpoints, and one made a capacity failure look like a crash. The stream list is read newest first (`--order-by LastEventTime --descending`), so a crowded log group still shows the lane's own stream.
+- Absent: an error pattern may name the calls it applies to, and only `Could not find endpoint` (not `... endpoint configuration`) makes an endpoint absent; text with no operation is never absent. A shell script never pipes an aws call into grep, because under `pipefail` the pipeline's status is the aws exit code and a waiter built that way never ended; `shared/tests/test_awscli.py` enforces it.
+- DCP backend: an `mla_dsa` architecture with DCP > 1 always gets `--dcp-comm-backend ag_rs` (`SM_VLLM_DCP_COMM_BACKEND=ag_rs`), recorded as the family's `dcp_flags` in `shared/catalog/attention.json`; a runtime not known to take the flag gets no DCP on SageMaker. The pinned AWS image picks `a2a` otherwise, and FlashMLA sparse raises `NotImplementedError` at startup. `runtimes.json` records, for that image, each flag and feature a served endpoint used, with its evidence class. The modeled KV pool can differ from the one vLLM logs; a race records the measured pool, which replaces the modeled one. The image's `vllm_version` stays null, so a flag's first release alone never adds an untried flag (KV offload) to a SageMaker launch.
+- Sampling: `serve.repetition_penalty` (default 1.0, `null` keeps the checkpoint's) becomes `--override-generation-config '{"repetition_penalty":1.0}'`, merged into any explicit object of that flag, and `plan --explain` shows it. vLLM applies a checkpoint's `generation_config.json` to every request, and a penalty above 1.0 there can degrade long reasoning output.
+- Recovery: a `Failed` endpoint of yours no longer blocks `start`. The race deletes one an earlier run left (tagged `ManagedBy=drip-ai`, `StartedBy` you, outside `lifecycle.protect`) when its configuration name, a content hash, differs from the lane's, or when it failed for capacity before any container started, then creates the lane; with the configuration that failed after its container started, the lane leaves the race and nothing is relaunched.
+- Disk: `runtime probe --docker` refuses when the home disk (or `/var/lib/docker`) has less than `disk.min_free_gb` (default 30) GB free and points at `--help-file` with output captured on a GPU host. It is the only local pull or large download drip-ai runs; the EC2 boot script's pull and download run on the instance.
+- Logs IAM: the execution role's grant on `/aws/sagemaker/Endpoints/${project}-*` covers every name the race creates. The sagemaker root refuses a `project` other than `drip-ai`, and `race.py` refuses a plan whose endpoint, model, or configuration name breaks the `drip-ai-` rule or whose log group is not the endpoint's own.
+- Doctor: log-group retention (R6) is fixed only on a group drip-ai tagged as yours, older than an hour, and not protected; an untagged group is reported (R7) with the command to run.
+- Not verified live: the wording of `Could not find endpoint` beyond the form `Could not find endpoint "<name or ARN>"`; `--override-generation-config` on the pinned image (derived from its reported version); `ag_rs` on Blackwell; where CloudWatch Logs sorts a stream with no events by `LastEventTime`.
+
+## 2026-10-09: Plan, race, and learn in a Python control core
+
+- Decided by: the project owner, after weighing two designs.
+- Choice: the decisions move into a stdlib-only Python package, `shared/drip_ai/` (Python 3.9, `python3 -I`, the AWS CLI as the only way into AWS), with facts as JSON under `shared/catalog/` and every config key in `shared/config/defaults.json`. Shell keeps routing, the Terraform wrappers, the lease, the picker, the approval, and the dashboard.
+- Config: layers, lowest first, are built-in, derived (the sizing engine and learning, only where the built-in value is null), model profile, user file (`$DRIP_AI_CONFIG` or `~/.config/drip-ai/config.json`, 0600, at most 256 KB), the declared `DRIP_AI_*` variables (`DRIP_AI_LINK_CLIENTS`, `DRIP_AI_PORT`, and `DRIP_AI_LEARN` keep working), and command-line flags. `bin/drip-ai plan --explain` and `config show --explain` print each value with its layer and reason. `config import-tfvars` moves the old `sagemaker/terraform/terraform.tfvars` tuning once; `start` refuses while that file still holds it, so tuning is never silently ignored. Profiles gain optional `serve.*` keys and `weights: s3|hf`, keyed by `model_type` or an exact `Org/Name@revision`.
+- Sizing: `shared/drip_ai/sizing.py` derives the context window, DCP, KV dtype, MTP, and the performance flags from `config.json`, the instance catalog, and per-image capabilities (`shared/catalog/runtimes.json`), and never falls back to a fixed window. It holds the only `SM_VLLM_*` mapper; the flag rules the Terraform preconditions enforced (shape, stray values, secret-shaped flags, owned flags) move there. SageMaker drops a derived flag the image is not known to accept; EC2 tries it; an explicitly configured flag known to be rejected refuses the plan. The pinned image's DCP, fp8 KV, and MTP evidence is recorded for sm90 only, so Blackwell plans use the bf16 layout until evidence exists.
+- Ownership: Terraform's `sagemaker` root holds only the per-region foundation, the execution role, with logs on `/aws/sagemaker/Endpoints/drip-ai-*`, read on `models/*` of that region's bucket, and pull on the pinned repository; `bin/drip-ai setup` applies it per region. `sagemaker/race.py` creates each lane's model, endpoint configuration (InstancePools of one GPU class, `VariantInstanceProvisionTimeoutInSeconds` 3600), log group (14-day retention), and endpoint through the API, tagged `Project=drip-ai`, `ManagedBy=drip-ai`, `Stack=sagemaker`, `StartedBy`, and `RunId`. Model and configuration names are content hashes (`drip-ai-m-<hash>`, `drip-ai-c-<hash>-<n>`), so reruns reuse them; every created name must start with `drip-ai-` and fit 63 characters, which keeps the role's log grant valid for any lane. `sagemaker stop` deletes endpoints only, in every configured region, and leaves anyone else's alone; `bin/drip-ai doctor` cleans the free models, configurations, and log groups.
+- Race: lanes are (region, GPU class) endpoints named `drip-ai-<class>-<region>-<n>`, at most `race.max_lanes` (4) and `race.max_spend_per_hour_usd` (none by default), one per eligible pair first and extra ones by learned placement chance. One error classifier (`shared/catalog/aws_errors.json`) drives the policy: a capacity failure with no log stream is deleted and planned again; any other failure has its log read and recorded and is never relaunched; quota parks the lane; throttling and timeouts back off and mark the lane unsure; expired credentials pause the whole race with no mutating call, a reminder every 15 minutes, and `notify.argv`, and the race resumes only for the same base principal. A create happens only after a describe answered absent, with intent journaled to `~/.local/state/drip-ai/runs/<id>.json` first and INT and HUP blocked around it; `race resume` re-adopts lanes by journal and `RunId` without creating. `--detach` races in the background. The cap is wall-clock time.
+- Learning: `~/.local/state/drip-ai/observations.jsonl` (0600, rotated at 5 MB) records placement attempts, startups, KV measurements, credential expiries, and capacity offers; it orders regions and pools (Beta(1, 1), 7-day half-life), feeds flag evidence and measured KV pools to the next plan, and never overrides explicit config or excludes a region. `DRIP_AI_LEARN=off` plans exactly as an empty store does.
+- Clients and ports: a tunnel links nothing by default; `clients.link` opts clients in. opencode gets one provider per tunnel (`drip-ai`, or `drip-ai-<region>` while another runs), and sets its top-level model only with `clients.opencode.set_default_model`. The link never writes opencode's `compaction`: opencode applies that buffer to every model of every provider, so a value sized for a million-token window makes smaller models compact far too early (248,576, the buffer for compacting at 800,000 of 1,048,576, exceeds a 200,000-token window, which then compacts on every turn); the design's `compact_at` key was dropped for that reason, and the setting stays in the user's own `opencode.json`. Tunnels register in `~/.local/state/drip-ai/procs/`; a port held by another process is refused by its pid unless `ports.auto` takes the next free one; drip-ai stops only a registered process whose start time still matches.
+- EC2: `bin/drip-ai capacity search|held|chain` read capacity-block offerings and held blocks across regions, with zone opt-in, subnet, and vCPU quota checks, and plan a gapless chain; `capacity buy <offering> --yes` is the only purchase path. The EC2 root takes `capacity_reservation_id`, `market_type`, `availability_zone`, and `zone_subnets`, ignores boot-script changes, and keeps the vLLM argv in `/etc/drip-ai/vllm.args`, which `ec2 reconfigure` rewrites over SSM and restarts in place. The EC2 instance profile now takes the region suffix the 2026-10-08 entry names for it.
+- Runtime probe. `bin/drip-ai runtime probe --help-file FILE|--docker` parses `vllm serve --help` and records each checked flag as supported or rejected, measured, for that image digest in `shared/catalog/runtimes.json`, so a new image's flags are known before the first scarce launch.
+- Rejected: an incremental bash race that loops `start.sh` per region with Terraform-owned models per region, because a multi-region state machine with pools, a journal, and adoption in bash 3.2 arrays is hard to test, and per-region Terraform for models fights `tf`'s account and region guard; it also lacked a structural read-only guard, an identity check on resume, and a chain planner. An in-cloud racer (Lambda or Step Functions) was rejected for now as added infrastructure; it is the direction if credential expiry and laptop sleep keep ending races despite the pause and `--detach`.
+- Residual risk: API-owned models and configurations reverse part of the 2026-10-07 entry; orphans rely on the tags and `doctor`. The Python race could regress subtle ownership and signal cases the bash race handled; the ported `test_start.py` scenarios cover the known ones. The modeled KV bytes (788 per layer on mla_dsa at fp8), the 6% overhead, and the 1.10 margin are unverified against a real log, so a wrong number can cost one launch before a measured pool replaces it. A pause that outlasts the cap drains lanes that might have won. The probe proves a flag parses, not that its kernel works on a given GPU.
+- Not verified live: InstancePools' `FailureReason` wording beyond the capacity text seen so far, which instance type `describe-endpoint` reports for a pool, `InferenceAmiVersion` beside InstancePools (left unset by default), `iam:SimulatePrincipalPolicy` permission for every member (a refused simulation warns and continues), and the capacity-block quota name. `index_head_dim` and the draft-layer count of any real checkpoint are read from its `config.json`.
+- Deferred: `runtime probe --ecs` (the fetch task definition needs the Hugging Face token parameter at launch, which only `fetch` creates); an automatic EC2 relaunch without a flag the log shows unknown (`ec2 reconfigure` does it by hand).
+
+## 2026-10-08: Name the models bucket per region outside us-east-1
+
+- Decided by: the project owner.
+- Choice: `shared/modules/conventions` names the models bucket `drip-ai-models-<account>` in us-east-1, as before, and `drip-ai-models-<account>-<region>` in every other region. Bucket names are global, so a second region cannot reuse the first region's name. Every stack that reads `bucket_name` gets the region-specific name from its own `region`.
+- Why: a second region needs its own shared stack, state bucket, and models copy. A region-specific bucket keeps those separate without a second naming scheme.
+- IAM names are account-global, so the same rule applies to the roles and profile in `shared/fetch-model` (task and execution), `sagemaker/terraform` (execution), and `ec2/terraform` (server role and instance profile): outside us-east-1 they end in `-<region>`.
+- Rejected: a suffix variable set per run, because forgetting it on a later `shared apply` would plan to rename the bucket and destroy its weights.
+- Residual risk: each region keeps its own copy of the weights, so the first-time fetch costs time and Fargate hours per region, and the storage bills in each region. Not verified: `setup` and `fetch` end to end in a second region.
+
+## 2026-10-07: Create SageMaker endpoints through the AWS API
+
+- Decided by: the project owner.
+- Choice: `sagemaker/start.sh` creates the endpoints with `create-endpoint`, tagged `Project=drip-ai`, `ManagedBy=sagemaker/start.sh`, `Stack=sagemaker`, and `StartedBy=<identity>`. Terraform keeps the model, IAM, per-lane endpoint configs, and log groups; the `started_by` variable is gone, `start` sets the `lane_counts` map, and the `lanes` output maps each endpoint name to its config name. This gives retries with no state lock, so a capacity failure recreates at once. It gives several lanes per type that follow the live endpoint quota (read with `aws service-quotas list-service-quotas --service-code sagemaker`, which needs `servicequotas:ListServiceQuotas`), clamped to `lanes_per_type` (1 to 6, default 2), and lanes bound by ARN and creation time, so `start` never touches a same-named endpoint this run did not create. An S3 lease named `sagemaker-race` (15 minutes, refreshed every 3) allows one race at a time. One approval covers the race, capped by `--hours` (whole hours 1 to 24, default 8; `start` only). After a win, deleting the losers is capped at 2 hours; cleanup after Ctrl-C, the cap, or every lane failing has no time limit. `stop` ends a race on this machine (waiting up to 5 minutes), refuses one on another machine, and deletes the endpoints, including the legacy names `drip-ai` and `drip-ai-<type>`, before Terraform's destroy question; it skips the destroy if an endpoint cannot be deleted. Terraform's apply output shows in the terminal. The fit table adds `ml.p6-b200` and `ml.p6-b300`.
+- Rejected: keeping the Terraform endpoint resource, because its state lock holds each retry back for up to 60 minutes.
+- Residual risk: lanes that win together each bill until they leave `Creating`, bounded by quota. A SIGKILLed `start` leaves its lanes billing until `stop`. Not verified live: the exact capacity `FailureReason` text (the pattern matches `InsufficientInstanceCapacity` and `Unable to provision requested ML compute capacity`), and whether `create-endpoint` accepts the JSON `--tags`.
+
 ## 2026-10-07: Publish a model-neutral source snapshot
 
 - Decided by: the project owner, requesting an open-source release with model choices kept private.
@@ -13,7 +68,7 @@ Newest first. These entries describe infrastructure and serving contracts; examp
 
 ## 2026-10-06: Explicit approval, lane fit, and CLI integration
 
-- Decided by: the project owner, with the implementation design locked by the maintainer.
+- Decided by: the project owner.
 - Choice: `--yes` answers only the current command's confirmation after its plan and costs print. It never supplies endpoint names for `--take-over` or `--force`, or a Hugging Face token. Public model copies can use it; gated copies remain interactive.
 - Lane fit: `sagemaker start` races only configured types whose GPU memory can hold the weights at a 90% threshold, passing the kept list to the saved Terraform plan. This is a weight-only preflight; runtime memory and context cache still need validation.
 - Workflow: `up` runs `sagemaker start --no-watch` then `sagemaker tunnel --smoke`. Closing the tunnel restores client links and leaves the endpoint running. A failed smoke test leaves the tunnel open for diagnosis.
@@ -23,7 +78,7 @@ Newest first. These entries describe infrastructure and serving contracts; examp
 
 ## 2026-10-06: Temporary client links
 
-- Decided by: the project owner, with the implementation design locked by the maintainer.
+- Decided by: the project owner.
 - Choice: tunnels link installed Codex, Claude Code CLI, and opencode clients using private sidecar records, owner locks, compare-and-swap writes, and symlink-resistant reads. If configuration is unchanged, unlink restores its original bytes. Otherwise it restores only values that still equal the link's writes, preserving later edits.
 - Credentials: Codex and Claude Code use an SSM key-reading command. opencode requires a private 0600 key file in a 0700 directory while linked, since its provider configuration has no equivalent command hook. Unlink deletes that file.
 - Control: `DRIP_AI_LINK_CLIENTS` and `--no-link` choose which clients to link. Each client links independently; a failed link leaves the tunnel and other successful links running. Stop and destroy commands unlink clients before removing the server.
@@ -32,7 +87,7 @@ Newest first. These entries describe infrastructure and serving contracts; examp
 
 ## 2026-10-06: Race endpoint capacity and clean up every lane
 
-- Decided by: the project owner, with the implementation design ratified by the maintainer.
+- Decided by: the project owner.
 - Choice: one Terraform root creates one endpoint per configured `instance_types` entry, sharing a model and execution role. `start` polls every 15 seconds. The first `InService` lane wins; ties use configuration order. Losing lanes are deleted, and a race with no winner ends after 3 hours.
 - Ownership: a lane is never chosen or deleted until its `StartedBy` tag is readable and belongs to the caller, or an explicitly approved takeover binds to its identity. Stop also finds caller-owned endpoints outside Terraform state.
 - Recovery: Terraform waits 60 minutes and can time out before the race finishes. A winner may therefore be outside state. `stop` checks AWS directly and reports success only once endpoints are gone. Transitional endpoints can refuse deletion; cleanup retries and reports possible ongoing billing when interrupted.
@@ -41,7 +96,7 @@ Newest first. These entries describe infrastructure and serving contracts; examp
 
 ## 2026-10-06: Model profiles and architecture preflight
 
-- Decided by: the project owner, with the implementation design locked by the maintainer.
+- Decided by: the project owner.
 - Choice: SageMaker reads `model_type` and `architectures[0]` from S3 before apply. Profiles supply model-specific vLLM flags; the generated registry supplies architecture compatibility for the pinned release. Operator flags merge last and win on shared flags. Argument validation rejects malformed flags, secret-shaped flags, and flags owned by Terraform variables.
 - Window: an explicit `max_model_len` configures the server and clients consistently. The SageMaker default is 131072 tokens; available memory must hold the weights, cache, and overhead. Context-cache sizing depends on the model architecture and precision.
 - Smoke: text responses must be nonempty and free of raw reasoning or tool markup. Automatic tool choice must return a named function with JSON arguments, exercising the parser rather than forcing a structured-output result.
@@ -50,7 +105,7 @@ Newest first. These entries describe infrastructure and serving contracts; examp
 
 ## 2026-10-05: Shared state and backend ownership
 
-- Decided by: the project owner, with the architecture ratified by the maintainer.
+- Decided by: the project owner.
 - Choice: `bin/drip-ai` routes to backend folders. Each stack has a Terraform root and separate state key in a tagged, encrypted, private, versioned, TLS-only S3 bucket. Backend configuration derives from the caller's account and Region. Bootstrap keeps local state. Resource names and image pins live in `shared/modules/conventions`.
 - Secrets: the API key uses Terraform's write-only value mechanism; state stores no key value. Client authentication reads it from SSM at use time, subject to the opencode file exception above.
 - Guards: endpoint owner tags, Terraform locks, account checks, and fetch leases prevent collisions among trusted account members. Expected bucket-owner checks refuse buckets owned by another account. Provider lockfiles are readonly during operator initialization.
@@ -59,7 +114,7 @@ Newest first. These entries describe infrastructure and serving contracts; examp
 
 ## 2026-10-05: Copy model weights inside AWS
 
-- Decided by: the project owner, with the architecture ratified by the maintainer.
+- Decided by: the project owner.
 - Choice: a Terraform-defined Fargate task copies a pinned Hugging Face revision into S3. It streams multipart uploads, verifies file size and hashes, resumes verified objects, refuses conflicting revisions and nested model prefixes, and records progress in a manifest. A lifecycle rule aborts incomplete multipart uploads.
 - Credentials: the operator enters a token at a hidden prompt. SSM holds it while ECS may still need to resolve it; cleanup removes it once no task can still be starting. A shared S3 lease and task checks coordinate the shared parameter. Secret input may briefly occupy a private temporary file for the AWS CLI; cleanup removes it.
 - Tags: Terraform owns the task definition. Launched ECS tasks carry project tags at creation, the explicit exception to Terraform-only resource creation. Network interfaces and public IPv4 charges also need to be included in cost estimates.
@@ -68,7 +123,7 @@ Newest first. These entries describe infrastructure and serving contracts; examp
 
 ## 2026-10-05: Serve vLLM through private access paths
 
-- Decided by: the project owner, with the backend design ratified by the maintainer.
+- Decided by: the project owner.
 - Choice: EC2 runs the pinned vLLM container and uses SSM port-forwarding, with no inbound security-group rules. SageMaker uses AWS's pinned vLLM image and a loopback proxy that authenticates clients and signs `InvokeEndpointWithResponseStream` requests. The proxy supplies `/v1/models` locally and routes the client APIs through the endpoint.
 - APIs: vLLM handles chat completions, Responses, and Messages directly. The proxy carries requests rather than translating APIs. Its request-size and service-duration limits remain part of the client contract.
 - EC2 credentials: instance permissions explicitly restrict SSM parameter reads to the API key and optional model-download token. The metadata hop limit prevents the bridge-networked container from reaching IMDS.

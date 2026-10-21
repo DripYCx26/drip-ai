@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/DripYCx26/drip-ai/security/advisories/new
+    about: Use a private advisory, not a public issue.

@@ -26,10 +26,43 @@ For a gated Hugging Face repo, store a token under a name such as `/drip-ai/ec2-
 2. Run `bin/drip-ai ec2 logs` until vLLM reports it is serving. The first boot downloads the weights; duration depends on their size, throughput, and initialization.
 3. [Open the tunnel](running.md#open-the-tunnel) with `bin/drip-ai ec2 tunnel`.
 
-A changed model or vLLM flag replaces the instance on the next `apply`. A new API key does not, so replace it yourself after a key rotation:
+The boot script runs once. A later `apply` never replaces the instance for a changed model, flag, or key, because Terraform ignores boot-script changes. Change flags in place instead:
+
+```bash
+bin/drip-ai ec2 reconfigure -- --enable-auto-tool-choice --tool-call-parser <parser>
+```
+
+`reconfigure` rewrites `/etc/drip-ai/vllm.args` on the instance over SSM RunCommand (the model, the served name, the tensor parallel size, and the window from Terraform, then your flags, checked by the same rules as SageMaker's), then restarts vLLM there; it serves again once the model loads. With no flags it clears them. If the vLLM log shows `unrecognized arguments: <flag>`, rerun `reconfigure` without that flag. To change the model, or to take a rotated API key, replace the instance yourself:
 
 ```bash
 bin/drip-ai tf ec2 apply -replace=aws_instance.server
+```
+
+## Use a capacity block
+
+A capacity block reserves GPUs for a fixed window at an upfront fee. These commands only read:
+
+```bash
+bin/drip-ai capacity search --class h200           # offerings in your regions, earliest first
+bin/drip-ai capacity held                          # blocks you hold, active or scheduled
+bin/drip-ai capacity chain --class h200 --hours 72 # held blocks and offerings end to end, with each gap
+```
+
+`search` covers the config's `regions` (or `--regions all`), for `capacity.duration_hours` (24) starting within `capacity.window_days` (7). Each line names the offering id, zone, window, fee, and flags: `zone not-opted-in` (opt the zone in first), `needs subnet` (the default VPC has no subnet there), and whether the capacity-block vCPU quota covers the type. UltraServer offerings stay hidden unless `capacity.include_ultraservers` is true.
+
+Buying spends the fee at once and cannot be undone. Only this command buys, and only with `--yes` and one offering id:
+
+```bash
+bin/drip-ai capacity buy <offering id> --region <region> --yes
+```
+
+To launch into the block, set these in `ec2/terraform/terraform.tfvars`, then `bin/drip-ai ec2 apply`:
+
+```hcl
+capacity_reservation_id = "cr-..."          # from capacity buy or capacity held
+market_type             = "capacity-block"
+availability_zone       = "us-east-1a"      # the block's zone
+zone_subnets            = { "us-east-1a" = "subnet-..." }
 ```
 
 ## Pause or delete the server
@@ -50,4 +83,7 @@ These are all the EC2 commands:
 | `bin/drip-ai ec2 stop` | Stops the instance |
 | `bin/drip-ai ec2 status` | Instance id, type, and state |
 | `bin/drip-ai ec2 logs` | The last 100 lines of the boot log and the vLLM log |
-| `bin/drip-ai ec2 tunnel` | Serves `http://localhost:8000` through SSM and links your coding tools |
+| `bin/drip-ai ec2 reconfigure [-- FLAG...]` | Rewrites the instance's vLLM flags and restarts vLLM in place |
+| `bin/drip-ai ec2 tunnel` | Serves `http://localhost:<port>` through SSM and links the clients in `clients.link` |
+| `bin/drip-ai serve ec2` | The same tunnel, in the background |
+| `bin/drip-ai capacity search\|held\|chain\|buy` | Capacity blocks; only `buy` spends |

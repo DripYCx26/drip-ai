@@ -9,8 +9,8 @@ Pick the backend your account has GPU quota and capacity for.
 | Topic | SageMaker | EC2 |
 | --- | --- | --- |
 | What runs | A managed SageMaker endpoint with AWS's vLLM image | One GPU instance you manage, running the pinned vLLM container |
-| GPUs | 8x H200 or 8x H100 (`ml.p5en`, `ml.p5e`, `ml.p5`) | L40S by default (`g6e`), any type your quota allows |
-| Capacity | `start` races configured instance types and keeps the first that comes up; capacity is not guaranteed | Needs EC2 GPU vCPU quota in your Region; ask AWS to raise it before the first apply |
+| GPUs | 8x H200 or 8x H100 (`ml.p5en`, `ml.p5e`, `ml.p5`), or B200 and B300 (`ml.p6-b200`, `ml.p6-b300`) once quota is approved | L40S by default (`g6e`), any type your quota allows |
+| Capacity | `start` races endpoints across your regions and GPU classes and keeps the first that comes up; capacity is not guaranteed | Needs EC2 GPU vCPU quota, or a [capacity block](ec2.md#use-a-capacity-block) |
 | Pause | No stop: delete it, and start again later | `ec2 stop` and `ec2 start`; the disk bills while stopped |
 | Commands | `bin/drip-ai sagemaker ...` | `bin/drip-ai ec2 ...` |
 | Details | [SageMaker backend](sagemaker.md) | [EC2 backend](ec2.md) |
@@ -38,7 +38,7 @@ From a folder on your machine, in Hugging Face format (`config.json` and `*.safe
 
 ## Start the server
 
-Configure the selected model's serving flags and memory settings before starting GPUs. SageMaker requires a [local model profile](models.md#add-a-profile); EC2 reads your `vllm_extra_args` directly. The public snapshot has no selected model or parser preset.
+Configure the selected model's serving flags before starting GPUs. SageMaker requires a [local model profile](models.md#add-a-profile) and derives the window and memory settings; read them first with `bin/drip-ai plan <name> --explain`. EC2 reads your `vllm_extra_args` directly. The public snapshot has no selected model or parser preset.
 
 Follow your backend's page:
 
@@ -49,13 +49,13 @@ The server bills from here until you stop it.
 
 ## Open the tunnel
 
-Run the tunnel in its own terminal and leave it open:
+Run the tunnel in its own terminal and leave it open, with the command `start` printed for the winning endpoint:
 
 ```bash
-bin/drip-ai sagemaker tunnel   # or: bin/drip-ai ec2 tunnel
+bin/drip-ai sagemaker tunnel --region <region> --endpoint <name>   # or: bin/drip-ai ec2 tunnel
 ```
 
-The tunnel serves the model at `http://localhost:8000` (set `DRIP_AI_PORT` to change it) and accepts only requests that carry the team's API key. It prints `Context window: <n> tokens` and, once the model answers, links your coding tools to it. Ctrl-C closes the tunnel and restores their config. [Connect clients](connect-clients.md) covers each tool.
+The tunnel serves the model at `http://localhost:<port>` (`ports.base`, default 8000) and accepts only requests that carry that region's API key. It prints `Context window: <n> tokens` and, once the model answers, links the coding tools in `clients.link` (opencode only by default; `bin/drip-ai config set clients.link=codex,claude,opencode` adds Codex and Claude Code). Ctrl-C closes the tunnel and restores their config. `bin/drip-ai serve` runs it in the background instead. [Connect clients](connect-clients.md) covers each tool.
 
 ## Check it works
 
@@ -79,7 +79,7 @@ It runs `sagemaker start`, stops there if the start fails or you decline it, the
 
 ## Approve a run with --yes
 
-`setup`, `fetch`, `up`, `sagemaker start|stop|deploy`, and `ec2 apply|destroy` ask for confirmation before their infrastructure or copy changes. Review the Terraform plans and any cost estimates shown. `ec2 start` resumes an existing instance immediately without a confirmation prompt, so approve its cost before invoking it. Add `--yes` to answer that question for one run you already approved, so a script or an app can run it without that confirmation prompt. `ec2 start` also accepts `--yes`, but already starts without prompting. `--yes` never answers these:
+`setup`, `fetch`, `up`, `sagemaker start|stop|deploy`, and `ec2 apply|destroy` ask for confirmation before their infrastructure or copy changes. Review the Terraform plans and any cost estimates shown. `ec2 start` resumes an existing instance immediately without a confirmation prompt, so approve its cost before invoking it. Add `--yes` to answer that question for one run you already approved, so a script or an app can run it without that confirmation prompt. `ec2 start` also accepts `--yes`, but already starts without prompting. One `yes` on `sagemaker start` covers the whole race, including recreating capacity failures and deleting the losers. `--hours N` (1 to 24, default 8) caps the race on `start` only, not on `up`. `--yes` never answers these:
 
 - The endpoint name that `--take-over` and `--force` ask you to type before touching someone else's endpoint.
 - The Hugging Face token. `fetch --yes` refuses a private or gated model; run it without `--yes` and type the token at the prompt.
@@ -88,7 +88,7 @@ It runs `sagemaker start`, stops there if the start fails or you decline it, the
 
 Stop the server when you finish:
 
-- SageMaker: `bin/drip-ai sagemaker stop` deletes the endpoint. Starting again is a full start.
+- SageMaker: `bin/drip-ai sagemaker stop` ends any race on this machine and deletes your endpoints in every configured region. The free models, configurations, and log groups stay for the next start; `bin/drip-ai doctor` lists the unused ones. Starting again is a full start.
 - EC2: `bin/drip-ai ec2 stop` pauses the instance, and `bin/drip-ai ec2 destroy` deletes it and its disk.
 
 These keep billing after a stop:

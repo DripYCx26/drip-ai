@@ -1,27 +1,34 @@
 # Contributing
 
-- For bug reports, include the command, expected result, operating system, tool versions, and a small redacted reproduction.
-- Open an issue before a larger change so maintainers can agree on its scope.
+Bug reports, fixes and docs improvements are welcome. For a bug, include the command you ran, what you expected, your operating system and tool versions, and a small redacted reproduction. For anything bigger than a fix, open an issue first so we can agree on the scope.
 
-## Make a change
+## Making a change
 
-- Fork the repository and create a branch.
-- Read the [architecture guide](docs/architecture.md). For agent-assisted setup changes, also read the [installation guide](AGENTS.md).
-- Keep changes focused and add regression coverage for changed behavior.
-- Run the repository check from the root:
+1. Fork the repository and branch from `main`.
+2. Skim [the architecture](docs/architecture.md) so the change lands in the component that owns it.
+3. Keep the change focused, and add a test for any behavior you change.
+4. Run the checks from the repository root:
 
-  ```bash
-  bin/drip-ai check
-  ```
+   ```bash
+   bin/drip-ai check --public
+   ```
 
-  The check needs Terraform, Bash, and Python. It initializes providers in temporary directories and uses mocked AWS calls; it needs no AWS credentials and creates no cloud resources. Provider downloads need internet access. A live serving test requires a separately approved deployment and tunnel.
+5. Open a pull request that says what the problem was, what changed, and which checks you ran.
 
-- Open a pull request that explains the problem, resulting behavior, and checks run.
+The checks need Terraform, Bash and Python 3.9 or newer. They run Terraform in throwaway directories against mocked AWS calls, so they need no credentials and create nothing in AWS. Provider downloads need internet access, and the full run takes several minutes. `--public` also confirms the tree names no model: see below.
 
-## Keep deployment details private
+Nothing in the test suite proves a model serves. That takes a real deployment, a tunnel and `bin/drip-ai smoke`, which spends money and stays out of CI.
 
-- Use fictional identifiers in tests and examples.
-- Keep weights, model choices, Terraform variables and state, credentials, client settings, and deployment logs out of commits, issues, and pull requests. Inspect the staged diff before submitting; ignored files can still be added with `git add -f`.
-- Keep the public architecture catalog general. Put model-specific configuration in your private working copy, and do not submit deployment profiles. The repository check requires the public profile map to remain `{}`; restore it before checking or submitting.
-- Report sensitive security issues through the [security policy](SECURITY.md).
-- Contributions are submitted under the [MIT License](LICENSE). Preserve applicable [third-party notices](NOTICE).
+## Keep deployments out of the repository
+
+Use made-up identifiers in tests, examples and docs, such as account `111122223333` and models like `Org/Name`. Keep weights, model choices, Terraform variables and state, credentials, client settings and logs out of commits, issues and pull requests. An ignored file can still be added with `git add -f`, so read the staged diff before you push.
+
+The repository ships `shared/model-profiles/profiles.json` as `{}` and no catalog or default file names a `model_type` or a Hugging Face repo id. Put your own profiles in your working copy, restore the empty map before you commit, and let `bin/drip-ai check --public` confirm it.
+
+## Style
+
+Follow the code around you. Shell scripts target Bash and must pass `bash -n`; Terraform must pass `terraform fmt`. Put facts such as prices, hardware and error patterns in `shared/catalog/*.json` and settings with their defaults in `shared/config/defaults.json`, not in code. Record changes to serving, networking, tagging or state in [docs/DECISIONS.md](docs/DECISIONS.md), newest first.
+
+## Security and license
+
+Report vulnerabilities as described in [SECURITY.md](SECURITY.md), not in a public issue. Contributions are submitted under the [MIT License](LICENSE); keep the [third-party notices](NOTICE) accurate.

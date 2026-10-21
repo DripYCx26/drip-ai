@@ -1,111 +1,76 @@
-# SageMaker CLI
+# drip-ai
 
-Run a model on AWS SageMaker from your terminal.
+Run an open-weight language model in your own AWS account and use it from Codex, Claude Code or opencode.
 
-- Download weights to S3, start endpoints, open a local tunnel, and stop them.
-- Serve vLLM at `http://127.0.0.1:8000` with no inbound security-group rules.
-- Connect Codex, Claude Code CLI, or opencode through temporary client settings.
-- Use the [EC2 backend](docs/ec2.md) if you need an instance you can pause.
-- Bring your own model and serving configuration. No weights or model presets are included.
+`bin/drip-ai` copies the weights into S3, starts vLLM on a SageMaker endpoint or an EC2 GPU instance, and opens a tunnel so the model answers on `http://127.0.0.1:8000`. Nothing is exposed to the internet, and there are no weights or model presets in this repository. You bring the model.
 
-The command is `bin/drip-ai`; existing scripts and AWS resource names use that name.
+## Why
+
+Hosted APIs are easy until you want a particular open-weight model, your data kept in your own account, or a bill you control. Running vLLM yourself is mostly the same chores each time: weights in S3, the right serving flags, a way in that is not a public port, and remembering to switch the GPUs off. This wraps those chores in one command line.
 
 ## Prerequisites
 
-- Linux, macOS, or [WSL](docs/setup.md#use-linux-or-windows).
-- Git, Bash, `curl`, and Python 3.9+ as `python3`.
-- [AWS CLI v2.22+](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and [Terraform 1.11+](https://developer.hashicorp.com/terraform/install).
-- An AWS profile with the required [permissions](docs/setup.md#permissions) and GPU quota in your Region.
-- For EC2, the [Session Manager plugin](docs/ec2.md#before-you-start).
+- Linux, macOS, or [WSL](docs/setup.md#use-linux-or-windows)
+- Git, Bash, `curl` and Python 3.9 or newer
+- [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) 2.22 or newer and [Terraform](https://developer.hashicorp.com/terraform/install) 1.11 or newer
+- An AWS profile with the [permissions](docs/setup.md#permissions) in the docs, and GPU quota in your Region
+- For EC2, the [Session Manager plugin](docs/ec2.md#before-you-start)
 
 ## Get started
 
-### 1. Clone and sign in
-
-Replace `your-profile` with your AWS profile. For SSO, run `aws sso login --profile your-profile` first.
+This path uses SageMaker. For one smaller instance you can pause, see the [EC2 guide](docs/ec2.md).
 
 ```bash
 git clone https://github.com/DripYCx26/drip-ai.git
 cd drip-ai
-export AWS_PROFILE=your-profile
-export DRIP_AI_REGION=us-east-1
-aws sts get-caller-identity
+export AWS_PROFILE=your-profile DRIP_AI_REGION=us-east-1
+
+bin/drip-ai setup                      # state bucket, models bucket, API key; starts no GPUs
+bin/drip-ai fetch Org/Name             # copy a Hugging Face model into S3
+bin/drip-ai plan Org/Name --explain    # what it will run, and why
+bin/drip-ai sagemaker start Org/Name   # race endpoints, keep the first that serves
+bin/drip-ai sagemaker tunnel           # in its own terminal; leave it open
+bin/drip-ai smoke                      # in another terminal
+bin/drip-ai sagemaker stop             # when you are done
 ```
 
-### 2. Set up storage and download a model
+Every command that spends money shows its plan and waits for `yes`. Before the first start, add a [profile](docs/models.md#add-a-profile) with your model's parser flags to `shared/model-profiles/profiles.json`; SageMaker refuses a model without one. `bin/drip-ai up Org/Name` runs start, tunnel and smoke together, and on macOS `drip-ai.command` opens a small menu over the same commands.
 
-```bash
-bin/drip-ai setup
-bin/drip-ai fetch Org/Name
-bin/drip-ai models list
+**Closing the tunnel does not stop billing.** A SageMaker endpoint costs money until you delete it with `sagemaker stop`. See [costs](docs/costs.md).
+
+## How it works
+
+```text
+coding tool -> localhost:8000 -> tunnel -> vLLM
+                                  SageMaker: local proxy signs the request with your AWS credentials
+                                  EC2:       SSM port-forward to the instance
 ```
 
-- Review each plan before typing `yes`.
-- `setup` creates the state bucket, models bucket, SSM API key, and resource group. It does not start a GPU server.
-- Replace `Org/Name` with a model you have permission to use. Enter a Hugging Face token at the hidden prompt, or press Enter for a public model.
-- `fetch` runs a Fargate copy task. Wait for it to finish before starting an endpoint. For local weights, see [upload instructions](docs/running.md#put-the-weights-in-s3).
+Terraform builds the shared pieces (state, models bucket, API key in SSM) and the EC2 server. SageMaker endpoints are created through the API, tagged `Project=drip-ai`, and raced: `start` tries your configured Regions and GPU classes at once and deletes the losers. A small Python core works out the context window, parallelism and vLLM flags from the model's `config.json` and the GPUs, and `plan --explain` shows its reasoning. The [architecture](docs/architecture.md) page has the rest.
 
-### 3. Configure serving
+## Models and hardware
 
-- Add your model's `model_type` to `shared/model-profiles/profiles.json` using the [model configuration guide](docs/models.md). The public profile map is empty.
-- Check architecture support, parser flags, GPU memory, context length, and AWS quota before starting.
-- To change instance types or serving settings, copy and edit the example below. See [SageMaker configuration](docs/sagemaker.md#before-you-start).
+Any architecture the pinned vLLM release serves can work; the list in `shared/model-profiles/vllm-architectures.json` is compatibility data, not a promise that a given model boots. You are responsible for the weights' license. See [choose a model](docs/models.md) for sizing.
 
-```bash
-cp sagemaker/terraform/terraform.tfvars.example sagemaker/terraform/terraform.tfvars
-```
+- **SageMaker:** 8-GPU instances in four classes: H200 (`ml.p5en`, `ml.p5e`), H100 (`ml.p5`), B200 and B300 (`ml.p6`, once quota is approved).
+- **EC2:** `g6e` (L40S) by default, or any GPU type your quota allows, including [capacity blocks](docs/ec2.md#use-a-capacity-block).
 
-### 4. Start and connect
+## Coding clients
 
-```bash
-bin/drip-ai sagemaker start Org/Name --no-watch
-bin/drip-ai sagemaker tunnel
-```
+The tunnel links the clients named in `clients.link` while it runs and restores their settings when it closes. opencode is linked by default; add the others with `bin/drip-ai config set clients.link=codex,claude,opencode`. The Claude desktop app is not supported. Details are in [connect clients](docs/connect-clients.md).
 
-- The start command races configured instance types. Several endpoints can bill at once; review the plan and let it finish deleting losing endpoints.
-- Leave the tunnel terminal open. It temporarily links installed coding clients.
-- After a successful link, restart Codex or opencode, or open a new Claude Code session. The Claude desktop app is unsupported. See [client configuration](docs/connect-clients.md).
+## Configuration
 
-### 5. Test and stop
+Settings come in layers, from built-in defaults to your own file at `~/.config/drip-ai/config.json`. `bin/drip-ai config show --explain` prints every key with its value and where it came from, and `config set` changes your file. [Configure drip-ai](docs/configuration.md) lists the keys.
 
-Run the smoke test in a second terminal while the tunnel is open:
+## Troubleshooting
 
-```bash
-bin/drip-ai smoke
-```
+`bin/drip-ai doctor` lists what drip-ai left running in AWS and on your machine. [Troubleshooting](docs/troubleshooting.md) covers capacity failures, stuck endpoints, expired credentials and checking spend.
 
-The test checks API responses and a parsed tool call. Model quality and other client features need separate testing.
+## Docs
 
-Close the tunnel with Ctrl-C, then delete the endpoints:
-
-```bash
-bin/drip-ai sagemaker stop
-bin/drip-ai status --json
-```
-
-**Closing the tunnel does not stop GPU billing.** Endpoints bill until deleted.
-
-For later runs, `bin/drip-ai up Org/Name` combines start, tunnel, and smoke. On macOS, `drip-ai.command` opens a Terminal menu.
-
-## Costs
-
-- Check AWS pricing for your Region and the command's plan before starting. `--yes` confirms only the current command after its plan prints.
-- SageMaker endpoints bill until deleted, including overlapping endpoints during a race.
-- EC2 compute bills while running; EBS disks also bill while stopped.
-- Fargate copies, S3 weights, logs, requests, and networking can add charges. Retained storage bills after shutdown.
-- Use `bin/drip-ai status --json` to inspect resources and [Cost Explorer](docs/troubleshooting.md#check-what-you-spend) to check spend.
-
-## Documentation
-
-- [Setup](docs/setup.md): permissions, quotas, and shared accounts.
-- [Run a model](docs/running.md): download, start, connect, and stop.
-- [SageMaker](docs/sagemaker.md) and [EC2](docs/ec2.md): backend configuration and cleanup.
-- [Model configuration](docs/models.md): sizing, profiles, and parser flags.
-- [Connect clients](docs/connect-clients.md): credentials, temporary settings, and recovery.
-- [Troubleshooting](docs/troubleshooting.md): failed starts and cleanup.
-- [Architecture](docs/architecture.md) and [decisions](docs/DECISIONS.md): implementation details.
-- [Contributing](CONTRIBUTING.md), [security reports](SECURITY.md), and [agent setup](AGENTS.md).
+The [docs index](docs/README.md) lists every guide. To contribute, read [CONTRIBUTING.md](CONTRIBUTING.md) and run `bin/drip-ai check --public`. Report vulnerabilities as described in [SECURITY.md](SECURITY.md). If you use a coding agent to install this, point it at [AGENTS.md](AGENTS.md).
 
 ## License
 
-[MIT](LICENSE) for project code. Model weights and third-party software retain their own licenses.
+Project code is under the [MIT License](LICENSE). Model weights, container images and the other software drip-ai uses keep their own licenses; check them before you download, serve or share anything. See [NOTICE](NOTICE).

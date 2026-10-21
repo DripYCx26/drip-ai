@@ -6,11 +6,11 @@ Set up your AWS access once, then create or join the account's shared stack. The
 
 1. Sign in with your own IAM Identity Center (SSO) or IAM user, never root keys. Configure a named profile with `aws configure sso` or `aws configure --profile <name>`, then `export AWS_PROFILE=<name>`.
 2. Check who you are with `aws sts get-caller-identity`.
-3. Pick one Region and keep it. Every command reads `DRIP_AI_REGION`, else `AWS_REGION`, else `AWS_DEFAULT_REGION`, else `us-east-1`, and the account's state and shared stack live there.
+3. Pick a home Region and keep it. Every command reads `DRIP_AI_REGION`, else `AWS_REGION`, else `AWS_DEFAULT_REGION`, else `us-east-1`; the account's state, the race lease, and the shared stack live there. A race can use more regions (`regions` in [your config](configuration.md)); each needs its own `setup`.
 4. Check your backend's GPU quota in that Region under Service Quotas. The [SageMaker](sagemaker.md#before-you-start) and [EC2](ec2.md#before-you-start) pages name the quota.
 5. Ask an admin for the [permissions](#permissions) below.
 
-SSO logins expire, and a start can run for hours, so log in again right before `setup` and `sagemaker start`. [Troubleshooting](troubleshooting.md#credentials-expire) has the fix when Terraform loses them.
+Logins expire, and a race can run for hours, so log in again right before `setup` and `sagemaker start`. A race pauses while its credentials are expired and resumes once you sign in again ([credentials expire](troubleshooting.md#credentials-expire)).
 
 ## Create the shared stack
 
@@ -20,7 +20,13 @@ The first person in an account and Region runs this once:
 bin/drip-ai setup
 ```
 
-It creates the Terraform state bucket `drip-ai-tfstate-<account>-<region>` when missing, prepares every Terraform root, and applies the shared stack: the models bucket `drip-ai-models-<account>`, the API key in SSM, and the `drip-ai` resource group. Terraform shows each plan and waits for `yes`. An admin role is simplest for this one run.
+It creates the Terraform state bucket `drip-ai-tfstate-<account>-<region>` when missing, prepares every Terraform root, applies the shared stack (the models bucket `drip-ai-models-<account>`, or `drip-ai-models-<account>-<region>` outside us-east-1, the API key in SSM, and the `drip-ai` resource group), then applies the SageMaker foundation: the execution role every race in that region uses. Terraform shows each plan and waits for `yes`. An admin role is simplest for this one run.
+
+To race in a second region, run it there too:
+
+```bash
+DRIP_AI_REGION=us-east-2 bin/drip-ai setup
+```
 
 ## Join a team
 
@@ -36,8 +42,8 @@ Terraform and the scripts run as you. Scope each permission to the `drip-ai` nam
 | --- | --- |
 | Every member | `s3:ListBucket` on the state bucket `drip-ai-tfstate-<account>-<region>` (plus `-<suffix>` if you set `DRIP_AI_STATE_BUCKET_SUFFIX`), and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on its `*.tfstate`, `*.tflock`, and `leases/*` objects; `s3:ListBucket`, `s3:GetObject`, `s3:PutObject` (with the multipart actions) on the models bucket `drip-ai-models-<account>`; `ssm:GetParameter` on `/drip-ai/api-key` |
 | Hugging Face fetch | `ecs:RunTask` on the fetch task definition, plus `ecs:DescribeTasks`, `ecs:ListTasks`, `ecs:StopTask`, `ecs:TagResource`; `iam:PassRole` on `drip-ai-fetch-model-task` and `drip-ai-fetch-model-execution` with `iam:PassedToService` set to `ecs-tasks.amazonaws.com`; `ssm:PutParameter` and `ssm:DeleteParameter` on `/drip-ai/hf-token`; `logs:GetLogEvents` on `/drip-ai/fetch-model`; `ecr:DescribeImages` on `repository/vllm` in registry `763104351884` and `ec2:DescribeVpcs`, `ec2:DescribeSubnets` (Terraform reads these at plan time); Terraform rights for ECS, EC2 security groups, IAM roles (including `iam:TagRole` and `iam:ListRolePolicies`), CloudWatch Logs (including `logs:TagResource` and `logs:PutRetentionPolicy`), and SSM |
-| SageMaker backend | `sagemaker:` Create, Delete, Describe, and Update for Model, EndpointConfig, and Endpoint, plus `sagemaker:AddTags` and `sagemaker:ListTags`; `sagemaker:ListEndpoints`; `sagemaker:InvokeEndpoint` on `endpoint/drip-ai-*` (this one action also authorizes the streaming call the proxy makes); `iam:` CreateRole, DeleteRole, GetRole, TagRole, ListRolePolicies, PutRolePolicy, DeleteRolePolicy, GetRolePolicy, and `iam:PassRole` on `role/drip-ai-sagemaker-execution`; `ecr:DescribeImages` on `repository/vllm` in registry `763104351884`; CloudWatch Logs on `/aws/sagemaker/Endpoints/drip-ai-*` (including `logs:TagResource` and `logs:PutRetentionPolicy`); `cloudwatch:GetMetricData` for the dashboard |
-| EC2 backend | EC2 instance, security group, and volume actions; IAM role and instance profile rights with `iam:PassRole` on `role/drip-ai-model-server`; `ssm:StartSession`, `ssm:SendCommand`, and `ssm:GetCommandInvocation`; `ssm:GetParameter` on the AMI parameter Terraform reads |
+| SageMaker backend | `sagemaker:` Create, Delete, Describe, and List for Model, EndpointConfig, and Endpoint, plus `sagemaker:AddTags` and `sagemaker:ListTags`, on `drip-ai-*` names; `servicequotas:ListServiceQuotas` (`start` reads the endpoint quota); `sagemaker:InvokeEndpoint` on `endpoint/drip-ai-*` (this one action also authorizes the streaming call the proxy makes); `iam:` CreateRole, DeleteRole, GetRole, TagRole, ListRolePolicies, PutRolePolicy, DeleteRolePolicy, GetRolePolicy, and `iam:PassRole` on `role/drip-ai-sagemaker-execution*` (one per region); `iam:SimulatePrincipalPolicy` on that role (without it, `start` warns that it could not check the log permission); `ecr:DescribeImages` on `repository/vllm` in registry `763104351884`; CloudWatch Logs on `/aws/sagemaker/Endpoints/drip-ai-*` (`CreateLogGroup`, `PutRetentionPolicy`, `TagResource`, `DescribeLogGroups`, `DescribeLogStreams`, `GetLogEvents`); `cloudwatch:GetMetricData` for the dashboard |
+| EC2 backend | EC2 instance, security group, and volume actions; IAM role and instance profile rights with `iam:PassRole` on `role/drip-ai-model-server*`; `ssm:StartSession`, `ssm:SendCommand` (also `ec2 reconfigure`), and `ssm:GetCommandInvocation`; `ssm:GetParameter` on the AMI parameter Terraform reads; for capacity blocks, `ec2:DescribeCapacityBlockOfferings`, `ec2:DescribeCapacityReservations`, `ec2:DescribeAvailabilityZones`, `ec2:DescribeVpcs`, `ec2:DescribeSubnets`, `servicequotas:ListServiceQuotas`, and, to buy, `ec2:PurchaseCapacityBlock` |
 | First setup | S3 bucket creation and configuration, `ssm:PutParameter` and tagging for the API key, and resource-group rights |
 
 Every command also calls `sts:GetCallerIdentity`, which needs no permission.

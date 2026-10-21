@@ -1,12 +1,25 @@
 # Connect clients
 
-A tunnel serves the model on `http://127.0.0.1:8000`: `bin/drip-ai sagemaker tunnel` for the SageMaker endpoint, or `bin/drip-ai ec2 tunnel` for the EC2 server. `DRIP_AI_PORT` changes the port. Once the tunnel reports a successful link, a fresh Codex, Claude Code CLI, or opencode session uses the served model. When it closes, each one goes back to its own settings.
+A tunnel serves the model on `http://127.0.0.1:<port>`, port `ports.base` (default 8000): `bin/drip-ai sagemaker tunnel` for a SageMaker endpoint, or `bin/drip-ai ec2 tunnel` for the EC2 server. `DRIP_AI_PORT` overrides the port. The tunnel links only the clients in `clients.link`: opencode by default, and Codex or Claude Code only when you list them. Once the tunnel reports a successful link, a fresh session of each linked client uses the served model. When it closes, each one goes back to its own settings.
+
+Turn linking on once, for the clients you want:
+
+```bash
+bin/drip-ai config set clients.link=codex,claude,opencode
+```
 
 `bin/drip-ai smoke` checks every API on the open tunnel. It needs a real text answer from chat completions, `/v1/messages`, and `/v1/responses`, and one parsed tool call.
 
 ## What the tunnel does
 
-Once the model answers, the tunnel links each installed client and prints one line per client:
+The tunnel registers itself in `~/.local/state/drip-ai/procs/` with its pid, port, endpoint, and region, and removes the record when it exits. Before it starts, it checks the port:
+
+- A registered tunnel already serving the same endpoint: the new one says `A drip-ai tunnel already serves <endpoint> (pid N on 127.0.0.1:P); nothing changed.` and exits.
+- Another process: the tunnel refuses and names its pid and command, unless `ports.auto` is true, which takes the next free port up to `ports.base + ports.range - 1`. It never stops a process it did not start.
+
+`bin/drip-ai serve [--region R] [--endpoint NAME]` runs the same tunnel in the background with its output in `~/.local/state/drip-ai/procs/`; `bin/drip-ai serve list` shows the running ones and `serve stop --port P` stops one, which unlinks its clients.
+
+Once the model answers, the tunnel links each named client that is installed and prints one line per client:
 
 ```text
 Codex: linked (restart Codex)
@@ -120,9 +133,18 @@ The link writes these keys to `opencode.json`, and creates the file when it is m
 }
 ```
 
-opencode has no hook that runs a command for the key, so the link writes the key to `~/.config/drip-ai/opencode-key` (mode 0600, in a 0700 folder) and deletes it when it unlinks. The key sits on your disk only while the tunnel is open. If the tunnel is killed with SIGKILL, the file stays until the next link or `bin/drip-ai unlink`.
+opencode has no hook that runs a command for the key, so the link writes the key to `~/.config/drip-ai/opencode-key` (mode 0600, in a 0700 folder) and deletes it when it unlinks. The key sits on your disk only while the tunnel is open. If the tunnel is killed with SIGKILL, the file stays until the next link, `bin/drip-ai unlink`, or `bin/drip-ai doctor --fix R13 --yes`.
 
-It refuses when `opencode.json` already defines a `drip-ai` provider it did not write, or when `opencode.jsonc` sits beside it, because opencode would read that file last.
+These settings change what the opencode link writes:
+
+| Setting | Effect |
+| --- | --- |
+| A second tunnel while one runs | Its provider is `drip-ai-<region>` (with its own link record, lock, and key file), so both endpoints show in opencode |
+| `clients.opencode.set_default_model` | `true` also sets the top-level `model` to this provider; by default the link leaves your model alone |
+
+The link never writes opencode's `compaction`. opencode applies it to every model of every provider, not per provider, so a buffer sized for a million-token window would make every smaller model compact far too early. If you set it in your own `opencode.json`, it applies to all your models.
+
+It refuses when `opencode.json` already defines the provider it writes without having written it, or when `opencode.jsonc` sits beside it, because opencode would read that file last.
 
 ## Opt out
 
@@ -130,7 +152,8 @@ You can keep the tunnel from touching some or all clients:
 
 | Setting | Effect |
 | --- | --- |
-| `DRIP_AI_LINK_CLIENTS=codex,claude` | Links only the clients named: `codex`, `claude`, `opencode`, `all` (the default), or `none` |
+| `clients.link` in your config | The clients a tunnel links; default opencode only, `[]` for none |
+| `DRIP_AI_LINK_CLIENTS=codex,claude` | Overrides `clients.link` for one run: `codex`, `claude`, `opencode`, `all`, or `none` |
 | `bin/drip-ai sagemaker tunnel --no-link` or `bin/drip-ai ec2 tunnel --no-link` | Links nothing |
 | `DRIP_AI_CODEX_LINK=0` or `--no-codex-link` | Skips Codex only |
 
@@ -143,7 +166,7 @@ These commands work on a stuck link or link by hand. `CLIENT` is `codex`, `claud
 | `bin/drip-ai status [CLIENT]` | Prints `linked` or `unlinked`, the owning process, and the current model |
 | `bin/drip-ai unlink [CLIENT]` | Restores what the link changed |
 | `bin/drip-ai unlink [CLIENT] --force` | Also drops a damaged link record or a stuck lock; for Codex without a record, removes drip-ai's tables |
-| `bin/drip-ai link [CLIENT] --model NAME --context-window TOKENS` | Links by hand to `127.0.0.1:$DRIP_AI_PORT` |
+| `bin/drip-ai link [CLIENT] --model NAME --context-window TOKENS` | Links by hand to `127.0.0.1:<port>` |
 | `bin/drip-ai codex link\|unlink\|status ...` | Codex's own link program with all its flags (`python3 -I shared/lib/codex_link.py --help`) |
 
 ## Troubleshooting
@@ -154,6 +177,7 @@ These commands work on a stuck link or link by hand. `CLIENT` is `codex`, `claud
 | `is not plain JSON` | The config has comments or trailing commas. The error prints the keys to add; paste them by hand, or remove the comments and reopen the tunnel |
 | `the API key command failed with only HOME and PATH=/usr/bin:/bin set` | Apps start the SSM read without your shell's environment. Use a named profile or SSO from `~/.aws/config` (`export AWS_PROFILE=<name>`) and reopen the tunnel. opencode still links |
 | `already linked by pid <n>` | Another tunnel owns that client's link. Close it, or run `bin/drip-ai unlink CLIENT` |
+| `port <n> is held by pid <m> (...)` | Another process listens there. Stop it if it is yours, set `DRIP_AI_PORT`, or `bin/drip-ai config set ports.auto=true` |
 | `settings.json env sets ANTHROPIC_AUTH_TOKEN` | Claude Code sends that token instead of the drip-ai key. Remove it while the tunnel is open |
 | A project ignores the link | A project's `.claude/settings.json` or `opencode.json` overrides your user config. Remove the model and base URL keys there |
 
@@ -165,7 +189,7 @@ For another client that supports the model's OpenAI-compatible APIs, configure i
 export DRIP_AI_API_KEY="$(bin/drip-ai key)"
 ```
 
-`bin/drip-ai key` refuses to print to a terminal, so the key stays out of your scrollback. The ChatGPT app can't use a self-hosted endpoint.
+`bin/drip-ai key` refuses to print to a terminal, so the key stays out of your scrollback. Each region's shared stack holds its own key; `key` and `smoke` read the key of the region whose registered tunnel serves the port, else the home region's. The ChatGPT app can't use a self-hosted endpoint.
 
 ## On a SageMaker endpoint
 
